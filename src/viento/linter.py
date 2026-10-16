@@ -271,13 +271,15 @@ class InvariantLinter:
             self.violations.append(
                 InvariantViolation(file_path, "DISALLOW_LATEST_TAG", f"Container '{c_name}' in '{workload_name}' missing image")
             )
-        elif image.endswith(":latest") or (":" not in image and "@" not in image):
-            self.violations.append(
-                InvariantViolation(
-                    file_path, "DISALLOW_LATEST_TAG",
-                    f"Container '{c_name}' in '{workload_name}' uses floating or unpinned image tag: '{image}'"
+        else:
+            last_segment = image.rsplit("/", 1)[-1]
+            if image.endswith(":latest") or ("@" not in image and ":" not in last_segment) or last_segment.endswith(":"):
+                self.violations.append(
+                    InvariantViolation(
+                        file_path, "DISALLOW_LATEST_TAG",
+                        f"Container '{c_name}' in '{workload_name}' uses floating or unpinned image tag: '{image}'"
+                    )
                 )
-            )
 
         resources = container.get("resources")
         if not resources:

@@ -36,6 +36,27 @@ spec:
           - image: "!*:latest"
           containers:
           - image: "!*:latest"
+  - name: require-image-tag-or-digest
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - apps
+          - monitoring
+          - traefik
+          - agent-sandbox
+    validate:
+      message: "Untagged container images are disallowed. Please specify an explicit image tag or sha256 digest."
+      pattern:
+        spec:
+          =(initContainers):
+          - image: "*:* | *@*"
+          =(ephemeralContainers):
+          - image: "*:* | *@*"
+          containers:
+          - image: "*:* | *@*"
 ---
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
@@ -44,11 +65,11 @@ metadata:
   labels:
     vmg.systems/tier: security-policy
   annotations:
-    policies.kyverno.io/title: Require Resource Limits
+    policies.kyverno.io/title: Require Resource Requests and Limits
     policies.kyverno.io/category: Resource Management
     policies.kyverno.io/severity: medium
     policies.kyverno.io/description: >-
-      Containers in the apps namespace must specify CPU and memory limits
+      Containers in the apps namespace must specify CPU and memory requests and limits
       to prevent memory starvation and node degradation.
 spec:
   validationFailureAction: Enforce
@@ -66,16 +87,22 @@ spec:
           - traefik
           - agent-sandbox
     validate:
-      message: "CPU and memory resource limits are required for all containers in the apps namespace."
+      message: "CPU and memory resource requests and limits are required for all containers in the apps namespace."
       pattern:
         spec:
           =(initContainers):
           - resources:
+              requests:
+                memory: "?*"
+                cpu: "?*"
               limits:
                 memory: "?*"
                 cpu: "?*"
           containers:
           - resources:
+              requests:
+                memory: "?*"
+                cpu: "?*"
               limits:
                 memory: "?*"
                 cpu: "?*"

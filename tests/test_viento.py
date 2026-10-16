@@ -8,12 +8,20 @@ from pathlib import Path
 from viento import __version__
 from viento.bench import run_sqlite_contention_benchmark
 from viento.cli import main
-from viento.dr_drill import run_dr_drill, verify_sqlite_archive
+from viento.dr_drill import run_dr_drill, verify_postgres_sql_archive, verify_sqlite_archive
 from viento.linter import InvariantLinter
 
 
-def test_viento_semver_version():
-    assert __version__ == "0.2.0"
+def test_viento_semver_version_and_single_source_sync():
+    repo_root = Path(__file__).resolve().parents[1]
+    version_file = (repo_root / "VERSION").read_text(encoding="utf-8").strip()
+    pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
+    readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
+
+    assert __version__ == "0.2.1"
+    assert version_file == __version__
+    assert f'version = "{__version__}"' in pyproject_text
+    assert f"(`v{__version__}`)" in readme_text
     assert main(["version"]) == 0
 
 
@@ -22,6 +30,15 @@ def test_viento_self_lint_clean():
     linter = InvariantLinter(repo_root)
     violations = linter.run()
     assert violations == [], f"Unexpected violations: {[str(v) for v in violations]}"
+
+
+def test_viento_kyverno_policy_parity_with_linter():
+    repo_root = Path(__file__).resolve().parents[1]
+    kyverno_text = (repo_root / "policies" / "kyverno-zero-trust.yaml").read_text(encoding="utf-8")
+    assert "require-image-tag-or-digest" in kyverno_text
+    assert 'image: "*:* | *@*"' in kyverno_text
+    assert "requests:" in kyverno_text
+    assert "limits:" in kyverno_text
 
 
 def test_viento_external_repo_portability_any_directory_and_readme():
@@ -43,7 +60,7 @@ spec:
     spec:
       containers:
         - name: api
-          image: ghcr.io/acme/api:1.4.2
+          image: registry.internal:5000/acme/api:1.4.2
           securityContext:
             privileged: false
             allowPrivilegeEscalation: false
@@ -73,6 +90,15 @@ spec:
           image: nginx:latest
           securityContext:
             privileged: true
+        - name: untagged-port-registry
+          image: registry.internal:5000/acme/untagged-service
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
 """,
             encoding="utf-8",
         )
@@ -81,6 +107,8 @@ spec:
         assert "DISALLOW_LATEST_TAG" in rules
         assert "REQUIRE_RESOURCE_LIMITS" in rules
         assert "DISALLOW_PRIVILEGED_CONTAINERS" in rules
+        latest_msgs = [v.message for v in violations if v.rule == "DISALLOW_LATEST_TAG"]
+        assert any("registry.internal:5000/acme/untagged-service" in m for m in latest_msgs)
 
 
 def test_viento_linter_sops_promql_flagger_and_pvc_shrink_rules():
@@ -198,3 +226,17 @@ COPY public.workflows (id, name) FROM stdin;
         capped_res = verify_sqlite_archive(gz_db, max_uncompressed_bytes=128)
         assert capped_res.passed is False
         assert "exceeds safety ceiling" in capped_res.detail
+
+        truncated_sql = base / "truncated_between_tables.sql"
+        truncated_sql.write_text(
+            """-- PostgreSQL database dump
+CREATE TABLE public.workflows (id integer NOT NULL, name text NOT NULL);
+COPY public.workflows (id, name) FROM stdin;
+1\talert-triage
+\\.
+""",
+            encoding="utf-8",
+        )
+        trunc_res = verify_postgres_sql_archive(truncated_sql)
+        assert trunc_res.passed is False
+        assert trunc_res.integrity_status == "missing_completion_footer"

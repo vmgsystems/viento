@@ -96,6 +96,7 @@ def verify_sqlite_archive(
 def verify_postgres_sql_archive(
     archive_path: Path,
     max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    require_completion_footer: bool = True,
 ) -> ArchiveDrillResult:
     """Verifies a PostgreSQL pg_dump (.sql or .sql.gz) archive for decompression, schema DDL, and completion markers."""
     try:
@@ -131,9 +132,26 @@ def verify_postgres_sql_archive(
                 elif "PostgreSQL database dump complete" in line or "COMMIT;" in line:
                     has_completion_footer = True
 
-        passed = table_count > 0 and not in_copy_block
-        status_str = "ok" if passed else ("truncated_copy" if in_copy_block else "empty_schema")
-        detail = "OK (pg_dump verified)" if (passed and has_completion_footer) else ("OK" if passed else "Missing tables or truncated COPY block")
+        passed = table_count > 0 and not in_copy_block and (has_completion_footer or not require_completion_footer)
+        if in_copy_block:
+            status_str = "truncated_copy"
+        elif table_count == 0:
+            status_str = "empty_schema"
+        elif require_completion_footer and not has_completion_footer:
+            status_str = "missing_completion_footer"
+        else:
+            status_str = "ok"
+
+        if passed and has_completion_footer:
+            detail = "OK (pg_dump verified)"
+        elif passed:
+            detail = "OK"
+        elif in_copy_block:
+            detail = "Truncated COPY block"
+        elif table_count == 0:
+            detail = "Empty schema (no CREATE TABLE found)"
+        else:
+            detail = "Truncated dump: missing PostgreSQL completion footer"
         return ArchiveDrillResult(
             archive_name=archive_path.name,
             passed=passed,
@@ -156,6 +174,7 @@ def verify_postgres_sql_archive(
 def run_dr_drill(
     backup_dir: Path,
     max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+    require_completion_footer: bool = True,
 ) -> List[ArchiveDrillResult]:
     results: List[ArchiveDrillResult] = []
     if not backup_dir.exists():
@@ -173,5 +192,11 @@ def run_dr_drill(
     for arch in sqlite_candidates:
         results.append(verify_sqlite_archive(arch, max_uncompressed_bytes=max_uncompressed_bytes))
     for arch in sql_candidates:
-        results.append(verify_postgres_sql_archive(arch, max_uncompressed_bytes=max_uncompressed_bytes))
+        results.append(
+            verify_postgres_sql_archive(
+                arch,
+                max_uncompressed_bytes=max_uncompressed_bytes,
+                require_completion_footer=require_completion_footer,
+            )
+        )
     return results

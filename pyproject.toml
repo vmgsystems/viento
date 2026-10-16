@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "viento-cli"
-version = "0.2.0"
+version = "0.2.1"
 description = "VMG Viento: Autonomous Infrastructure, SQLite Contention Benchmarking, Cold DR Verification & GitOps Linter"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -26,3 +26,7 @@ viento = "viento.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

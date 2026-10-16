@@ -2,6 +2,14 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.2.1] - 2026-10-16
+
+### Fixed & Changed
+- **Registry Port-Aware Image Tag Pinning (`viento lint`):** `DISALLOW_LATEST_TAG` now inspects the image reference path after the last `/` so untagged images hosted on custom-port registries (`host:port/repo`) are accurately flagged instead of treating `:port` as an image tag.
+- **Strict PostgreSQL `pg_dump` Completion Footer Verification (`viento dr-drill`):** Requires a valid `PostgreSQL database dump complete` footer (`missing_completion_footer` detection) so mid-stream truncated SQL dumps are rejected even when earlier DDL/DML headers are present.
+- **1:1 Kyverno `ClusterPolicy` Parity (`policies/kyverno-zero-trust.yaml`):** Added `require-image-tag-or-digest` (`image: "*:* | *@*"`) to `disallow-latest-tag` to block untagged images at the API server boundary, and updated `require-resource-limits` (`check-resources`) to enforce both CPU and memory `requests` and `limits` across `containers` and `initContainers`.
+- **Single-Source SemVer Synchronization & Native `pytest` Configuration:** Synchronized `0.2.1` across `VERSION`, `pyproject.toml`, `viento.__version__`, and `README.md`, and configured `[tool.pytest.ini_options]` with `pythonpath = ["src"]` and `testpaths = ["tests"]` for out-of-the-box test execution.
+
 ## [v0.2.0] - 2026-10-16
 
 ### Added

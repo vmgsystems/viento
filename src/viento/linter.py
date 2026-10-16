@@ -113,7 +113,11 @@ class InvariantViolation:
 
 
 class InvariantLinter:
-    def __init__(self, repo_root: Path, pvc_floors: Optional[Dict[str, str]] = None):
+    def __init__(
+        self,
+        repo_root: Path,
+        pvc_floors: Optional[Dict[str, str]] = None,
+    ):
         self.repo_root = repo_root.resolve()
         self.violations: List[InvariantViolation] = []
         self.gitignore = GitIgnoreResolver(self.repo_root)
@@ -213,7 +217,6 @@ class InvariantLinter:
             return
         self._live_pvc_loaded = True
 
-        # 1. Load static PVC floors from .viento.yaml and constructor overrides
         cfg_floors = self.config.get("pvc_capacity_floors") or {}
         merged_floors: Dict[str, str] = {}
         if isinstance(cfg_floors, dict):
@@ -227,7 +230,6 @@ class InvariantLinter:
                 "storageClassName": "static-baseline",
             }
 
-        # 2. Augment with live Kubernetes API PVC capacities when kubeconfig is available
         kubeconfig_path = self._resolve_kubeconfig_path()
         if not kubeconfig_path:
             return
@@ -265,7 +267,6 @@ class InvariantLinter:
         image = container.get("image", "")
         c_name = container.get("name", "unknown")
 
-        # 1. Image tag verification
         if not image:
             self.violations.append(
                 InvariantViolation(file_path, "DISALLOW_LATEST_TAG", f"Container '{c_name}' in '{workload_name}' missing image")
@@ -278,7 +279,6 @@ class InvariantLinter:
                 )
             )
 
-        # 2. Resource limits & requests verification
         resources = container.get("resources")
         if not resources:
             self.violations.append(
@@ -306,7 +306,6 @@ class InvariantLinter:
                         )
                     )
 
-        # 3. Privileged & privilege escalation verification
         allowlist = set(self.config.get("privileged_allowlist") or [])
         if workload_name not in allowlist:
             sec_ctx = container.get("securityContext") or {}
@@ -421,7 +420,6 @@ class InvariantLinter:
             meta = doc.get("metadata") or {}
             name = meta.get("name", "unnamed")
 
-            # Check SOPS secret encryption on ALL Kubernetes Secret manifests
             if kind == "Secret" and not sops_violation_recorded:
                 if not file_path.name.endswith((".sops.yaml", ".sops.yml")):
                     self.violations.append(
@@ -434,7 +432,6 @@ class InvariantLinter:
                     )
                     sops_violation_recorded = True
 
-            # Workload container checks
             if kind in WORKLOAD_KINDS:
                 w_name, pod_spec = self.extract_pod_spec(doc)
                 containers = pod_spec.get("containers") or []
@@ -453,7 +450,7 @@ class InvariantLinter:
                             self.violations.append(
                                 InvariantViolation(
                                     rel_path, "SQLITE_BACKUP_TIMEOUT_GUARD",
-                                    f"Container '{c.get('name')}' in '{kind}/{w_name}' executes sqlite3 backup without '-cmd \".timeout 60000\"'"
+                                    f"Container '{c.get('name')}' in '{kind}/{w_name}' executes sqlite3 backup without '-cmd ".timeout 60000"'"
                                 )
                             )
                     if "sed -i" in cmd_str and ("INSERT INTO " in cmd_str or "INSERT OR IGNORE INTO " in cmd_str or '["' in cmd_str):
@@ -464,7 +461,6 @@ class InvariantLinter:
                             )
                         )
 
-            # Flagger Canary Schema Exclusivity
             if kind == "Canary":
                 analysis = (doc.get("spec") or {}).get("analysis") or {}
                 has_iterations = "iterations" in analysis
@@ -477,7 +473,6 @@ class InvariantLinter:
                         )
                     )
 
-            # MetricTemplate Traefik v3 Regex and PromQL Zero-Denominator Guard
             if kind == "MetricTemplate":
                 query = (doc.get("spec") or {}).get("query", "")
                 if "traefik_service_requests" in query:
@@ -497,7 +492,6 @@ class InvariantLinter:
                             )
                         )
 
-            # Flux Notification Provider Endpoint Validation
             if kind == "Provider" and "notification.toolkit.fluxcd.io" in str(doc.get("apiVersion", "")):
                 p_type = (doc.get("spec") or {}).get("type", "")
                 p_addr = (doc.get("spec") or {}).get("address", "")
@@ -509,7 +503,6 @@ class InvariantLinter:
                         )
                     )
 
-            # Live Cluster & Configured PVC Immutability & Capacity Shrink Guard
             if kind == "PersistentVolumeClaim":
                 self._load_live_pvcs()
                 ns = meta.get("namespace", "default")
@@ -653,27 +646,21 @@ class InvariantLinter:
                 ext = p.suffix.lower()
                 posix_path = p.as_posix()
 
-                # Check plaintext secrets in text files
                 if ext in TEXT_EXTENSIONS or file in {"Dockerfile", "Makefile"}:
                     self.check_plaintext_secrets(p)
 
-                # Check files for configured decommissioned resource references
                 if ext in {".md", ".py", ".sh", ".ts", ".yaml", ".yml"}:
                     self.check_documentation_decommissioned_resources(p)
 
-                # Universal content-aware Kubernetes YAML manifest validation
                 if ext in {".yaml", ".yml"} and self.is_candidate_k8s_yaml(p):
                     self.check_k8s_manifest(p)
 
-                # Check OPNsense XML firewall configs
                 if file.endswith(".xml") and "opnsense" in posix_path.lower():
                     self.check_opnsense_config(p)
 
-                # Check wrapper scripts for excessive inline duplication
                 if ext in {".ps1", ".sh"} and "scripts" in p.parts:
                     self.check_wrapper_duplication(p)
 
-                # Check Node.js / ESM files for syntax validity
                 if ext in {".mjs", ".js"}:
                     self.check_node_syntax(p)
 

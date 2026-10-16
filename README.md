@@ -11,8 +11,8 @@
 In sailing and vector physics, **Velocity Made Good (VMG)** measures true net velocity directly toward the mark, stripping away leeway and drag. `VMG Viento` eliminates infrastructure drag across Kubernetes and hybrid-cloud environments through three open-source diagnostic engines and zero-trust policy baselines:
 
 1. **`viento-lint` (`viento lint`):** Universal content-aware GitOps & Kubernetes zero-trust invariant linter enforcing pinned image tags (`DISALLOW_LATEST_TAG`), container CPU/memory requests and limits (`REQUIRE_RESOURCE_LIMITS`), non-privileged execution (`DISALLOW_PRIVILEGED_CONTAINERS`), SOPS secret encryption (`SOPS_ENCRYPTION`), Flagger Canary schema mutual exclusion, Traefik v3 metric regexes, PromQL zero-denominator guards (`PROMQL_ZERO_DENOMINATOR_GUARD`), SQLite online backup `.timeout 60000` guards, and live/configured PVC capacity shrink prevention (`PVC_CAPACITY_SHRINK_FORBIDDEN`) across any directory structure.
-2. **`viento-bench` (`viento bench`):** Empirical, symmetric SQLite storage lock-contention benchmark measuring both single-statement autocommit `INSERT` latency (`autocommit_insert_ms`), interleaved reader aggregations (`interleaved_query_ms`), and batched transactions (`batched_tx_ms`) between default rollback-journal (`DELETE`) mode and tuned NVMe `WAL` mode (`64 MiB` page cache + `256 MiB` `mmap`).
-3. **`viento-dr-drill` (`viento dr-drill`):** Automated cold-archive decompression and integrity verification for both SQLite (`.sqlite3.gz`, `.db`) and PostgreSQL `pg_dump` (`.sql.gz`, `.sql`) backups with bounded streaming decompression and virtual-table resilience.
+2. **`viento-bench` (`viento bench`):** Empirical, symmetric SQLite storage lock-contention benchmark measuring single-statement autocommit `INSERT` latency (`autocommit_insert_ms`), interleaved reader aggregations (`interleaved_query_ms`), and batched transactions (`batched_tx_ms`) between default rollback-journal (`DELETE`) mode and tuned NVMe `WAL` mode (`64 MiB` page cache + `256 MiB` `mmap`).
+3. **`viento-dr-drill` (`viento dr-drill`):** Automated cold-archive decompression and integrity verification for both SQLite (`.sqlite3.gz`, `.db`) and PostgreSQL `pg_dump` (`.sql.gz`, `.sql`) backups with bounded streaming decompression (`--max-size-mb`) and virtual-table resilience.
 4. **Zero-Trust Kyverno Policies (`policies/kyverno-zero-trust.yaml`):** Production `Enforce`-mode admission policies tuned for a `39 MiB` memory footprint.
 
 ---
@@ -28,8 +28,8 @@ viento lint .
 # 2. Benchmark SQLite DELETE journal vs tuned WAL mode on a target directory
 viento bench --workdir /tmp/viento-bench --iterations 50
 
-# 3. Verify cold SQLite backup archives (.sqlite3.gz / .db)
-viento dr-drill --backup-dir ./backups
+# 3. Verify cold SQLite & PostgreSQL backup archives (.sqlite3.gz / .db / .sql.gz)
+viento dr-drill --backup-dir ./backups --max-size-mb 2048
 ```
 
 ---

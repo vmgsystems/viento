@@ -1,7 +1,6 @@
 """Comprehensive unit and behavioral test suite for VMG Viento Open-Core CLI."""
 
 import gzip
-import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -34,7 +33,6 @@ def test_viento_external_repo_portability_any_directory_and_readme():
         clusters_dir = root / "clusters" / "production"
         clusters_dir.mkdir(parents=True)
 
-        # 1. Valid K8s Deployment in clusters/production/ passes with 0 violations
         (clusters_dir / "api.yaml").write_text(
             """apiVersion: apps/v1
 kind: Deployment
@@ -62,7 +60,6 @@ spec:
         linter = InvariantLinter(root)
         assert linter.run() == []
 
-        # 2. Invalid K8s Deployment in clusters/production/ is caught regardless of directory name
         (clusters_dir / "bad.yaml").write_text(
             """apiVersion: apps/v1
 kind: Deployment
@@ -161,7 +158,6 @@ def test_viento_dr_drill_sqlite_postgres_and_safety_ceiling():
     with tempfile.TemporaryDirectory() as tmpdir:
         base = Path(tmpdir)
 
-        # 1. Valid compressed SQLite backup (.sqlite3.gz)
         raw_db = base / "sample.sqlite3"
         conn = sqlite3.connect(str(raw_db))
         conn.execute("CREATE TABLE monitors (id INTEGER PRIMARY KEY, name TEXT);")
@@ -174,7 +170,6 @@ def test_viento_dr_drill_sqlite_postgres_and_safety_ceiling():
             f_out.write(f_in.read())
         raw_db.unlink()
 
-        # 2. Valid compressed PostgreSQL pg_dump backup (.sql.gz)
         pg_dump_sql = """-- PostgreSQL database dump
 CREATE TABLE public.workflows (
     id integer NOT NULL,
@@ -198,9 +193,8 @@ COPY public.workflows (id, name) FROM stdin;
         assert by_name["n8n.sql.gz"].passed is True
         assert by_name["n8n.sql.gz"].table_count == 1
         assert by_name["n8n.sql.gz"].total_rows == 2
-        assert main(["dr-drill", "--backup-dir", str(base)]) == 0
+        assert main(["dr-drill", "--backup-dir", str(base), "--max-size-mb", "64"]) == 0
 
-        # 3. Verify bounded decompression rejects archives exceeding safety ceiling
         capped_res = verify_sqlite_archive(gz_db, max_uncompressed_bytes=128)
         assert capped_res.passed is False
         assert "exceeds safety ceiling" in capped_res.detail

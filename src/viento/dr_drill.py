@@ -70,7 +70,6 @@ def verify_sqlite_archive(
                         cnt = conn.execute(f'SELECT COUNT(*) FROM "{safe_tbl}";').fetchone()[0]
                         total_rows += int(cnt)
                     except sqlite3.OperationalError:
-                        # Skip custom extension-backed shadow tables if extension is not loaded
                         continue
                 passed = integrity.lower() == "ok" and len(tables) > 0
                 return ArchiveDrillResult(

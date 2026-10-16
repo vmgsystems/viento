@@ -450,7 +450,7 @@ class InvariantLinter:
                             self.violations.append(
                                 InvariantViolation(
                                     rel_path, "SQLITE_BACKUP_TIMEOUT_GUARD",
-                                    f"Container '{c.get('name')}' in '{kind}/{w_name}' executes sqlite3 backup without '-cmd ".timeout 60000"'"
+                                    f"Container '{c.get('name')}' in '{kind}/{w_name}' executes sqlite3 backup without '-cmd \".timeout 60000\"'"
                                 )
                             )
                     if "sed -i" in cmd_str and ("INSERT INTO " in cmd_str or "INSERT OR IGNORE INTO " in cmd_str or '["' in cmd_str):

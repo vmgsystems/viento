@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "viento-cli"
+version = "0.1.0"
+description = "VMG Viento: Autonomous Infrastructure, SQLite Contention Benchmarking, Cold DR Verification & GitOps Linter"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [
+  { name = "VMG Systems LLC", email = "engineering@vmg.systems" }
+]
+dependencies = [
+  "PyYAML>=6.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0"
+]
+
+[project.scripts]
+viento = "viento.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

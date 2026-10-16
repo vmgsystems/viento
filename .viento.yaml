@@ -1,0 +1,10 @@
+# VMG Viento Repository Configuration
+readme_required_anchors:
+  - token: "viento-lint"
+    description: "viento-lint mechanical GitOps linter"
+  - token: "viento-bench"
+    description: "viento-bench storage contention benchmark"
+  - token: "viento-dr-drill"
+    description: "viento-dr-drill cold backup verifier"
+  - token: "kyverno"
+    description: "Kyverno zero-trust policies"

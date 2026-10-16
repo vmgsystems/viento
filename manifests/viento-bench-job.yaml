@@ -1,0 +1,48 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: viento-sqlite-bench
+  namespace: default
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+      containers:
+        - name: bench
+          image: python:3.11-slim
+          command:
+            - python3
+            - -c
+            - |
+              import sqlite3, time
+              for mode, wal in [("DELETE", False), ("WAL", True)]:
+                  conn = sqlite3.connect(f"/bench/{mode}.db", isolation_level=None)
+                  if wal:
+                      conn.execute("PRAGMA journal_mode=WAL;")
+                      conn.execute("PRAGMA synchronous=NORMAL;")
+                      conn.execute("PRAGMA cache_size=-64000;")
+                  conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
+                  t0 = time.perf_counter()
+                  for i in range(200):
+                      conn.execute("INSERT INTO t (v) VALUES ('sample');")
+                  dt = (time.perf_counter() - t0) * 1000.0
+                  print(f"{mode}: {dt:.2f} ms")
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: bench-vol
+              mountPath: /bench
+      volumes:
+        - name: bench-vol
+          emptyDir: {}

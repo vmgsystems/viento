@@ -1,0 +1,136 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  labels:
+    vmg.systems/tier: security-policy
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Tag
+    policies.kyverno.io/category: Best Practices
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      The ':latest' image tag is unpredictable and makes rollback difficult.
+      Containers in the apps namespace must use explicit versions or digests.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: validate-image-tag
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - apps
+          - monitoring
+          - traefik
+          - agent-sandbox
+    validate:
+      message: "Using ':latest' image tag is disallowed in apps namespace. Please use an immutable semver tag or sha256 digest."
+      pattern:
+        spec:
+          =(initContainers):
+          - image: "!*:latest"
+          =(ephemeralContainers):
+          - image: "!*:latest"
+          containers:
+          - image: "!*:latest"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+  labels:
+    vmg.systems/tier: security-policy
+  annotations:
+    policies.kyverno.io/title: Require Resource Limits
+    policies.kyverno.io/category: Resource Management
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/description: >-
+      Containers in the apps namespace must specify CPU and memory limits
+      to prevent memory starvation and node degradation.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: check-resources
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - apps
+          - monitoring
+          - traefik
+          - agent-sandbox
+    validate:
+      message: "CPU and memory resource limits are required for all containers in the apps namespace."
+      pattern:
+        spec:
+          =(initContainers):
+          - resources:
+              limits:
+                memory: "?*"
+                cpu: "?*"
+          containers:
+          - resources:
+              limits:
+                memory: "?*"
+                cpu: "?*"
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged-containers
+  labels:
+    vmg.systems/tier: security-policy
+  annotations:
+    policies.kyverno.io/title: Disallow Privileged Containers
+    policies.kyverno.io/category: Pod Security Standards
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/description: >-
+      Privileged containers have access to all devices on the host and can bypass
+      container boundaries. Privileged mode is forbidden in apps namespace.
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: check-privileged
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - apps
+          - monitoring
+          - traefik
+          - agent-sandbox
+    exclude:
+      any:
+      - resources:
+          namespaces:
+          - apps
+          - monitoring
+          - traefik
+          - agent-sandbox
+          names:
+          - "forgejo-runner*"
+    validate:
+      message: "Privileged mode and privilege escalation are strictly forbidden in the apps namespace."
+      pattern:
+        spec:
+          =(initContainers):
+          - =(securityContext):
+              =(privileged): "false"
+              =(allowPrivilegeEscalation): "false"
+          =(ephemeralContainers):
+          - =(securityContext):
+              =(privileged): "false"
+              =(allowPrivilegeEscalation): "false"
+          containers:
+          - =(securityContext):
+              =(privileged): "false"
+              =(allowPrivilegeEscalation): "false"

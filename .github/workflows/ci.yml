@@ -1,0 +1,31 @@
+name: VMG Viento CI & SemVer Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install VMG Viento CLI & Test Dependencies
+        run: |
+          pip install -e ".[dev]"
+
+      - name: Execute Viento Self-Lint Gate
+        run: |
+          viento lint .
+
+      - name: Execute Viento Unit & DR Drill Suite
+        run: |
+          pytest -v

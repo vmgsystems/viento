@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """
-scripts/lint_invariants.py
-Mechanical Invariant Linter for VMG Systems Engineering Platform.
-Enforces architectural invariants, Kubernetes zero-trust policies,
-PromQL stability guards, and secrets hygiene.
+viento.linter
+Mechanical GitOps & Kubernetes Zero-Trust Invariant Linter (`viento lint`).
+Enforces architectural invariants, Kubernetes zero-trust admission policies,
+PromQL stability guards, SOPS secrets hygiene, PVC shrink protection, and
+JavaScript/ESM syntax validity across any Kubernetes GitOps repository.
 """
 
+import argparse
+import base64
+import fnmatch
+import json
 import os
-import sys
 import re
 import shutil
+import ssl
 import subprocess
-import fnmatch
-import argparse
+import sys
+import tempfile
+import time
+import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Dict, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import yaml
@@ -33,36 +40,26 @@ TEXT_EXTENSIONS = {
     ".py", ".yaml", ".yml", ".json", ".sh", ".ps1", ".mjs", ".js", ".md", ".txt", ".conf", ".xml", ".ts"
 }
 
-STATIC_PVC_CAPACITY_FLOORS = {
-    "apps/recruiter-monitor-data-pvc": "5Gi",
-    "apps/uptime-kuma-nvme-pvc": "5Gi",
-    "apps/uptime-kuma-data-pvc": "5Gi",
-    "apps/bazarr-config-nvme-pvc": "2Gi",
-    "apps/deal-sniper-nvme-pvc": "5Gi",
-    "apps/vaultwarden-nvme-pvc": "2Gi",
-    "apps/hermes-data-pvc": "10Gi",
-    "apps/qdrant-data-pvc": "10Gi",
-    "apps/n8n-data-pvc": "5Gi",
-    "apps/n8n-postgres-pvc": "10Gi",
-    "apps/langfuse-postgres-pvc": "10Gi",
-    "apps/openwebui-data-pvc": "5Gi",
-}
-
 SECRET_PATTERNS = [
     (re.compile(r"xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,32}"), "SLACK_TOKEN"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PRIVATE_KEY"),
     (re.compile(r"AIza[0-9A-Za-z-_]{35}"), "GOOGLE_API_KEY"),
-    (re.compile(r"gho_[0-9A-Za-z]{30,}"), "GITHUB_OAUTH_TOKEN"),
+    (re.compile(r"gh[pousr]_[0-9A-Za-z]{30,}"), "GITHUB_TOKEN"),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS_ACCESS_KEY"),
 ]
 
 WORKLOAD_KINDS = {
-    "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"
+    "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Pod"
+}
+
+K8S_RELEVANT_KINDS = WORKLOAD_KINDS | {
+    "Secret", "PersistentVolumeClaim", "Canary", "MetricTemplate", "Provider"
 }
 
 
 class GitIgnoreResolver:
     """In-memory .gitignore pattern resolver ensuring mechanical checks respect ignore boundaries."""
+
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root.resolve()
         self.patterns: List[str] = []
@@ -116,12 +113,25 @@ class InvariantViolation:
 
 
 class InvariantLinter:
-    def __init__(self, repo_root: Path):
+    def __init__(self, repo_root: Path, pvc_floors: Optional[Dict[str, str]] = None):
         self.repo_root = repo_root.resolve()
         self.violations: List[InvariantViolation] = []
         self.gitignore = GitIgnoreResolver(self.repo_root)
+        self.config: Dict[str, Any] = self._load_viento_config()
+        self._explicit_pvc_floors = pvc_floors or {}
         self._live_pvc_cache: Dict[str, Dict[str, Any]] = {}
         self._live_pvc_loaded: bool = False
+
+    def _load_viento_config(self) -> Dict[str, Any]:
+        cfg_path = self.repo_root / ".viento.yaml"
+        if cfg_path.exists() and yaml is not None:
+            try:
+                data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
 
     @staticmethod
     def parse_k8s_storage_bytes(val: Any) -> int:
@@ -149,44 +159,84 @@ class InvariantLinter:
         except ValueError:
             return 0
 
+    def _resolve_kubeconfig_path(self) -> Optional[Path]:
+        cfg_kc = self.config.get("kubeconfig")
+        if cfg_kc:
+            p = (self.repo_root / str(cfg_kc)).resolve()
+            if p.exists():
+                return p
+        env_kc = os.environ.get("KUBECONFIG", "").split(os.pathsep)[0].strip()
+        if env_kc:
+            p = Path(env_kc).expanduser()
+            if p.exists():
+                return p
+        default_kc = Path.home() / ".kube" / "config"
+        if default_kc.exists():
+            return default_kc
+        return None
+
+    def _with_k8s_ssl_context(self, kc_text: str):
+        """Creates a temporary SSLContext from kubeconfig and guarantees temp-file cleanup."""
+        server_m = re.search(r"server:\s*(\S+)", kc_text)
+        ca_m = re.search(r"certificate-authority-data:\s*(\S+)", kc_text)
+        cert_m = re.search(r"client-certificate-data:\s*(\S+)", kc_text)
+        key_m = re.search(r"client-key-data:\s*(\S+)", kc_text)
+        if not (server_m and ca_m and cert_m and key_m):
+            return None, None, []
+
+        server = server_m.group(1)
+        temp_files: List[str] = []
+        try:
+            with tempfile.NamedTemporaryFile(delete=False) as ca_f, \
+                 tempfile.NamedTemporaryFile(delete=False) as cert_f, \
+                 tempfile.NamedTemporaryFile(delete=False) as key_f:
+                temp_files.extend([ca_f.name, cert_f.name, key_f.name])
+                ca_f.write(base64.b64decode(ca_m.group(1)))
+                ca_f.flush()
+                cert_f.write(base64.b64decode(cert_m.group(1)))
+                cert_f.flush()
+                key_f.write(base64.b64decode(key_m.group(1)))
+                key_f.flush()
+            ctx = ssl.create_default_context(cafile=temp_files[0])
+            ctx.load_cert_chain(certfile=temp_files[1], keyfile=temp_files[2])
+            return server, ctx, temp_files
+        except Exception:
+            for tf in temp_files:
+                try:
+                    os.unlink(tf)
+                except OSError:
+                    pass
+            return None, None, []
+
     def _load_live_pvcs(self):
         if self._live_pvc_loaded:
             return
         self._live_pvc_loaded = True
-        for pvc_key, floor_storage in STATIC_PVC_CAPACITY_FLOORS.items():
+
+        # 1. Load static PVC floors from .viento.yaml and constructor overrides
+        cfg_floors = self.config.get("pvc_capacity_floors") or {}
+        merged_floors: Dict[str, str] = {}
+        if isinstance(cfg_floors, dict):
+            merged_floors.update({str(k): str(v) for k, v in cfg_floors.items()})
+        merged_floors.update(self._explicit_pvc_floors)
+
+        for pvc_key, floor_storage in merged_floors.items():
             self._live_pvc_cache[pvc_key] = {
                 "storage": floor_storage,
                 "bytes": self.parse_k8s_storage_bytes(floor_storage),
                 "storageClassName": "static-baseline",
             }
-        kubeconfig_path = self.repo_root / "iac" / "tofu" / "k8s" / "kubeconfig"
-        if not kubeconfig_path.exists():
+
+        # 2. Augment with live Kubernetes API PVC capacities when kubeconfig is available
+        kubeconfig_path = self._resolve_kubeconfig_path()
+        if not kubeconfig_path:
             return
+        temp_files: List[str] = []
         try:
-            import base64
-            import json
-            import ssl
-            import tempfile
-            import urllib.request
-
             kc_text = kubeconfig_path.read_text(encoding="utf-8")
-            server_m = re.search(r"server:\s*(\S+)", kc_text)
-            ca_m = re.search(r"certificate-authority-data:\s*(\S+)", kc_text)
-            cert_m = re.search(r"client-certificate-data:\s*(\S+)", kc_text)
-            key_m = re.search(r"client-key-data:\s*(\S+)", kc_text)
-            if not (server_m and ca_m and cert_m and key_m):
+            server, ctx, temp_files = self._with_k8s_ssl_context(kc_text)
+            if not server or not ctx:
                 return
-
-            server = server_m.group(1)
-            with tempfile.NamedTemporaryFile(delete=False) as ca_f, \
-                 tempfile.NamedTemporaryFile(delete=False) as cert_f, \
-                 tempfile.NamedTemporaryFile(delete=False) as key_f:
-                ca_f.write(base64.b64decode(ca_m.group(1))); ca_f.flush()
-                cert_f.write(base64.b64decode(cert_m.group(1))); cert_f.flush()
-                key_f.write(base64.b64decode(key_m.group(1))); key_f.flush()
-                ctx = ssl.create_default_context(cafile=ca_f.name)
-                ctx.load_cert_chain(certfile=cert_f.name, keyfile=key_f.name)
-
             req = urllib.request.Request(f"{server}/api/v1/persistentvolumeclaims")
             with urllib.request.urlopen(req, context=ctx, timeout=2) as resp:
                 items = json.loads(resp.read().decode("utf-8")).get("items", [])
@@ -203,9 +253,15 @@ class InvariantLinter:
                     }
         except Exception:
             pass
+        finally:
+            for tf in temp_files:
+                try:
+                    os.unlink(tf)
+                except OSError:
+                    pass
 
     def check_k8s_container_spec(self, container: Dict[str, Any], file_path: str, workload_name: str):
-        """Rule: DISALLOW_LATEST_TAG & REQUIRE_RESOURCE_LIMITS"""
+        """Rule: DISALLOW_LATEST_TAG, REQUIRE_RESOURCE_LIMITS & DISALLOW_PRIVILEGED_CONTAINERS"""
         image = container.get("image", "")
         c_name = container.get("name", "unknown")
 
@@ -250,8 +306,9 @@ class InvariantLinter:
                         )
                     )
 
-        # 3. Privileged & privilege escalation verification (1:1 with Kyverno disallow-privileged-containers)
-        if not workload_name.startswith("Deployment/forgejo-runner"):
+        # 3. Privileged & privilege escalation verification
+        allowlist = set(self.config.get("privileged_allowlist") or [])
+        if workload_name not in allowlist:
             sec_ctx = container.get("securityContext") or {}
             if sec_ctx.get("privileged") is True or sec_ctx.get("allowPrivilegeEscalation") is True:
                 self.violations.append(
@@ -263,23 +320,25 @@ class InvariantLinter:
 
     def extract_pod_spec(self, doc: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         kind = doc.get("kind", "")
-        name = doc.get("metadata", {}).get("name", "unnamed")
-        spec = doc.get("spec", {})
+        name = (doc.get("metadata") or {}).get("name", "unnamed")
+        spec = doc.get("spec") or {}
 
+        if kind == "Pod":
+            return name, spec
         if kind in {"Deployment", "StatefulSet", "DaemonSet", "Job"}:
-            template = spec.get("template", {})
-            return name, template.get("spec", {})
-        elif kind == "CronJob":
-            job_template = spec.get("jobTemplate", {}).get("spec", {})
-            template = job_template.get("template", {})
-            return name, template.get("spec", {})
+            template = spec.get("template") or {}
+            return name, template.get("spec") or {}
+        if kind == "CronJob":
+            job_template = (spec.get("jobTemplate") or {}).get("spec") or {}
+            template = job_template.get("template") or {}
+            return name, template.get("spec") or {}
         return name, {}
 
     def check_plaintext_secrets(self, file_path: Path):
         """Rule: PLAINTEXT_SECRET_DEFENSE - Scan non-SOPS text files for live secret signatures."""
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             return
-        if file_path.name in {"lint_invariants.py", "test_lint_invariants.py", "agent_pr_reviewer.py", "test_agent_pr_reviewer.py"}:
+        if file_path.name in {"linter.py", "lint_invariants.py", "test_viento.py", "test_lint_invariants.py"}:
             return
 
         try:
@@ -305,8 +364,23 @@ class InvariantLinter:
         except Exception:
             pass
 
+    @staticmethod
+    def is_candidate_k8s_yaml(file_path: Path) -> bool:
+        """Determines whether a YAML file should be parsed for Kubernetes manifest invariants."""
+        if file_path.name.endswith((".sops.yaml", ".sops.yml")):
+            return True
+        if file_path.name in {".viento.yaml", ".viento.yml", ".sops.yaml"}:
+            return False
+        if any(part in {".github", ".forgejo", "archive", "templates"} for part in file_path.parts):
+            return False
+        try:
+            head = file_path.read_text(encoding="utf-8", errors="ignore")[:8192]
+            return ("apiVersion:" in head and "kind:" in head)
+        except Exception:
+            return False
+
     def check_k8s_manifest(self, file_path: Path):
-        """Validates Kubernetes manifests for zero-trust admission invariants."""
+        """Validates Kubernetes manifests for zero-trust admission invariants across any directory."""
         rel_path = str(file_path.relative_to(self.repo_root))
         if yaml is None:
             self.violations.append(
@@ -321,14 +395,13 @@ class InvariantLinter:
             return
 
         sops_violation_recorded = False
-        if file_path.name.endswith(".sops.yaml"):
+        if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             if "sops:" not in content or "mac:" not in content:
                 self.violations.append(
                     InvariantViolation(rel_path, "SOPS_ENCRYPTION", "SOPS secret file missing 'sops:' or 'mac:' encryption markers")
                 )
                 sops_violation_recorded = True
 
-        # Parse YAML docs
         try:
             docs = list(yaml.safe_load_all(content))
         except Exception as e:
@@ -342,12 +415,15 @@ class InvariantLinter:
                 continue
 
             kind = doc.get("kind", "")
-            meta = doc.get("metadata", {})
+            if kind not in K8S_RELEVANT_KINDS:
+                continue
+
+            meta = doc.get("metadata") or {}
             name = meta.get("name", "unnamed")
 
             # Check SOPS secret encryption on ALL Kubernetes Secret manifests
             if kind == "Secret" and not sops_violation_recorded:
-                if not file_path.name.endswith(".sops.yaml"):
+                if not file_path.name.endswith((".sops.yaml", ".sops.yml")):
                     self.violations.append(
                         InvariantViolation(rel_path, "SOPS_ENCRYPTION", "Kubernetes Secret must be stored in encrypted .sops.yaml file")
                     )
@@ -361,55 +437,16 @@ class InvariantLinter:
             # Workload container checks
             if kind in WORKLOAD_KINDS:
                 w_name, pod_spec = self.extract_pod_spec(doc)
-                containers = pod_spec.get("containers", [])
-                init_containers = pod_spec.get("initContainers", [])
+                containers = pod_spec.get("containers") or []
+                init_containers = pod_spec.get("initContainers") or []
                 for c in containers:
                     self.check_k8s_container_spec(c, rel_path, f"{kind}/{w_name}")
                 for c in init_containers:
                     self.check_k8s_container_spec(c, rel_path, f"{kind}/{w_name} (init)")
 
-            # Flagger Canary Schema Exclusivity
-            if kind == "Canary":
-                analysis = doc.get("spec", {}).get("analysis", {})
-                has_iterations = "iterations" in analysis
-                has_weights = "stepWeight" in analysis or "maxWeight" in analysis
-                if has_iterations and has_weights:
-                    self.violations.append(
-                        InvariantViolation(
-                            rel_path, "FLAGGER_SCHEMA_MUTUAL_EXCLUSION",
-                            f"Canary '{name}' combines 'iterations' with 'stepWeight'/'maxWeight'. Must use one or the other."
-                        )
-                    )
-
-            # MetricTemplate Traefik v3 Regex and PromQL Zero-Denominator Guard
-            if kind == "MetricTemplate":
-                query = doc.get("spec", {}).get("query", "")
-                if "traefik_service_requests" in query:
-                    # In Traefik v3, CRD services are named <namespace>-<name>-<port>@kubernetescrd
-                    if 'service=~"{{ target }}' in query and '.*{{ target }}' not in query:
-                        self.violations.append(
-                            InvariantViolation(
-                                rel_path, "TRAEFIK_METRIC_REGEX",
-                                f"MetricTemplate '{name}' query uses prefix match. Traefik v3 requires wildcard: '.*{{{{ target }}}}.*'"
-                            )
-                        )
-                # PromQL division without > 0 guard
-                if "/" in query and "rate(" in query:
-                    # Look for division where denominator has rate but lacks > 0
-                    if "/ (sum(rate(" in query and "> 0" not in query:
-                        self.violations.append(
-                            InvariantViolation(
-                                rel_path, "PROMQL_ZERO_DENOMINATOR_GUARD",
-                                f"MetricTemplate '{name}' contains rate division without zero-denominator guard '> 0'"
-                            )
-                        )
-
-            # SQLite backup command timeout check on container specs
-            if kind in WORKLOAD_KINDS:
-                w_name, pod_spec = self.extract_pod_spec(doc)
-                all_c = pod_spec.get("containers", []) + pod_spec.get("initContainers", [])
+                all_c = containers + init_containers
                 for c in all_c:
-                    cmd_list = c.get("command", []) + c.get("args", [])
+                    cmd_list = (c.get("command") or []) + (c.get("args") or [])
                     cmd_str = " ".join(str(item) for item in cmd_list)
                     if "sqlite3" in cmd_str and (".backup" in cmd_str or ".dump" in cmd_str):
                         if ".timeout 60000" not in cmd_str:
@@ -427,10 +464,43 @@ class InvariantLinter:
                             )
                         )
 
+            # Flagger Canary Schema Exclusivity
+            if kind == "Canary":
+                analysis = (doc.get("spec") or {}).get("analysis") or {}
+                has_iterations = "iterations" in analysis
+                has_weights = "stepWeight" in analysis or "maxWeight" in analysis
+                if has_iterations and has_weights:
+                    self.violations.append(
+                        InvariantViolation(
+                            rel_path, "FLAGGER_SCHEMA_MUTUAL_EXCLUSION",
+                            f"Canary '{name}' combines 'iterations' with 'stepWeight'/'maxWeight'. Must use one or the other."
+                        )
+                    )
+
+            # MetricTemplate Traefik v3 Regex and PromQL Zero-Denominator Guard
+            if kind == "MetricTemplate":
+                query = (doc.get("spec") or {}).get("query", "")
+                if "traefik_service_requests" in query:
+                    if 'service=~"{{ target }}' in query and '.*{{ target }}' not in query:
+                        self.violations.append(
+                            InvariantViolation(
+                                rel_path, "TRAEFIK_METRIC_REGEX",
+                                f"MetricTemplate '{name}' query uses prefix match. Traefik v3 requires wildcard: '.*{{{{ target }}}}.*'"
+                            )
+                        )
+                if "/" in query and "rate(" in query:
+                    if "/ (sum(rate(" in query and "> 0" not in query:
+                        self.violations.append(
+                            InvariantViolation(
+                                rel_path, "PROMQL_ZERO_DENOMINATOR_GUARD",
+                                f"MetricTemplate '{name}' contains rate division without zero-denominator guard '> 0'"
+                            )
+                        )
+
             # Flux Notification Provider Endpoint Validation
             if kind == "Provider" and "notification.toolkit.fluxcd.io" in str(doc.get("apiVersion", "")):
-                p_type = doc.get("spec", {}).get("type", "")
-                p_addr = doc.get("spec", {}).get("address", "")
+                p_type = (doc.get("spec") or {}).get("type", "")
+                p_addr = (doc.get("spec") or {}).get("address", "")
                 if p_type == "alertmanager" and "/api/v2/alerts" not in p_addr:
                     self.violations.append(
                         InvariantViolation(
@@ -439,20 +509,20 @@ class InvariantLinter:
                         )
                     )
 
-            # Live Cluster PVC Immutability & Capacity Shrink Guard
+            # Live Cluster & Configured PVC Immutability & Capacity Shrink Guard
             if kind == "PersistentVolumeClaim":
                 self._load_live_pvcs()
                 ns = meta.get("namespace", "default")
                 key = f"{ns}/{name}"
                 if key in self._live_pvc_cache:
                     live_pvc = self._live_pvc_cache[key]
-                    manifest_storage = doc.get("spec", {}).get("resources", {}).get("requests", {}).get("storage", "")
+                    manifest_storage = ((doc.get("spec") or {}).get("resources") or {}).get("requests", {}).get("storage", "")
                     manifest_bytes = self.parse_k8s_storage_bytes(manifest_storage)
                     if manifest_bytes > 0 and live_pvc["bytes"] > 0 and manifest_bytes < live_pvc["bytes"]:
                         self.violations.append(
                             InvariantViolation(
                                 rel_path, "PVC_CAPACITY_SHRINK_FORBIDDEN",
-                                f"PVC '{key}' requests '{manifest_storage}', which is smaller than live cluster PVC capacity '{live_pvc['storage']}'"
+                                f"PVC '{key}' requests '{manifest_storage}', which is smaller than baseline/live PVC capacity '{live_pvc['storage']}'"
                             )
                         )
 
@@ -462,9 +532,7 @@ class InvariantLinter:
         try:
             tree = ET.parse(file_path)
             root = tree.getroot()
-            # If root has direct <aliases> child, that's the deprecated syntax
-            root_aliases = root.findall("./aliases")
-            if root_aliases:
+            if root.findall("./aliases"):
                 self.violations.append(
                     InvariantViolation(
                         rel_path, "OPNSENSE_ALIAS_HIERARCHY",
@@ -475,16 +543,16 @@ class InvariantLinter:
             pass
 
     def check_wrapper_duplication(self, file_path: Path):
-        """Rule: NO_INLINE_SOURCE_DUPLICATION - Wrapper scripts must not embed inline copies of standalone runtime modules."""
+        """Rule: NO_INLINE_SOURCE_DUPLICATION - Wrapper scripts must remain concise (<600 lines)."""
         rel_path = str(file_path.relative_to(self.repo_root))
         try:
             content = file_path.read_text(encoding="utf-8", errors="ignore")
             line_count = len(content.splitlines())
-            if "$replScript = @'" in content or "const CODE_TOKEN_REGEX =" in content or line_count > 600:
+            if line_count > 600:
                 self.violations.append(
                     InvariantViolation(
                         rel_path, "NO_INLINE_SOURCE_DUPLICATION",
-                        f"Wrapper script ({line_count} lines) embeds duplicate runtime source code or exceeds 600-line wrapper ceiling"
+                        f"Wrapper script ({line_count} lines) exceeds 600-line modular wrapper ceiling"
                     )
                 )
         except Exception:
@@ -511,13 +579,37 @@ class InvariantLinter:
 
     def check_documentation_decommissioned_resources(self, file_path: Path):
         """Rule: DECOMMISSIONED_RESOURCE_LEAK - Optional via .viento.yaml decommissioned_tokens."""
-        return
+        tokens = self.config.get("decommissioned_tokens") or []
+        if not tokens or not isinstance(tokens, list):
+            return
+        rel_path = str(file_path.relative_to(self.repo_root))
+        qualifiers = {
+            "decommission", "decommissioned", "destroy", "destroyed", "retire", "retired",
+            "migrated", "legacy", "former", "historical", "past", "reclaim", "reclaimed",
+            "purged", "stopped", "deprecated", "timeline", "completed"
+        }
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line_idx, line in enumerate(f, start=1):
+                    lower = line.lower()
+                    for tok in tokens:
+                        tok_str = str(tok).lower()
+                        if tok_str and tok_str in lower and not any(q in lower for q in qualifiers):
+                            self.violations.append(
+                                InvariantViolation(
+                                    file_path=rel_path,
+                                    rule="DECOMMISSIONED_RESOURCE_LEAK",
+                                    message=f"Referencing decommissioned resource '{tok}' without decommissioning qualifier",
+                                    line_number=line_idx
+                                )
+                            )
+        except Exception:
+            pass
 
     def check_readme_coverage(self):
-        """Rule: README_COVERAGE - Ensure README.md documents core cluster infrastructure and services."""
+        """Rule: README_COVERAGE - Ensure README.md exists and satisfies optional .viento.yaml anchors."""
         readme_path = self.repo_root / "README.md"
-        # Only require README if checking a git repo root or if README.md exists
-        if not (self.repo_root / ".git").exists() and not readme_path.exists():
+        if not (self.repo_root / ".git").exists() and not readme_path.exists() and not self.config:
             return
 
         if not readme_path.exists():
@@ -527,27 +619,15 @@ class InvariantLinter:
             return
 
         content = readme_path.read_text(encoding="utf-8", errors="ignore").lower()
-        required_anchors = [
-            ("viento-lint", "viento-lint mechanical GitOps linter"),
-            ("viento-bench", "viento-bench storage contention benchmark"),
-            ("viento-dr-drill", "viento-dr-drill cold backup verifier"),
-            ("kyverno", "Kyverno zero-trust policies"),
-        ]
-        viento_cfg_path = self.repo_root / ".viento.yaml"
-        if viento_cfg_path.exists() and yaml is not None:
-            try:
-                cfg = yaml.safe_load(viento_cfg_path.read_text(encoding="utf-8")) or {}
-                if "readme_required_anchors" in cfg and isinstance(cfg["readme_required_anchors"], list):
-                    custom_anchors = []
-                    for item in cfg["readme_required_anchors"]:
-                        if isinstance(item, dict) and "token" in item:
-                            tok = str(item["token"]).lower()
-                            custom_anchors.append((tok, str(item.get("description", tok))))
-                        elif isinstance(item, str):
-                            custom_anchors.append((item.lower(), item))
-                    required_anchors = custom_anchors
-            except Exception:
-                pass
+        required_anchors: List[Tuple[str, str]] = []
+        if "readme_required_anchors" in self.config and isinstance(self.config["readme_required_anchors"], list):
+            for item in self.config["readme_required_anchors"]:
+                if isinstance(item, dict) and "token" in item:
+                    tok = str(item["token"]).lower()
+                    required_anchors.append((tok, str(item.get("description", tok))))
+                elif isinstance(item, str):
+                    required_anchors.append((item.lower(), item))
+
         missing = [desc for token, desc in required_anchors if token not in content]
         if missing:
             self.violations.append(
@@ -571,68 +651,48 @@ class InvariantLinter:
                 if self.gitignore.is_ignored(p):
                     continue
                 ext = p.suffix.lower()
+                posix_path = p.as_posix()
 
                 # Check plaintext secrets in text files
                 if ext in TEXT_EXTENSIONS or file in {"Dockerfile", "Makefile"}:
                     self.check_plaintext_secrets(p)
 
-                # Check files for decommissioned resource references
-                if ext in {".md", ".py", ".sh", ".ts", ".yaml"}:
+                # Check files for configured decommissioned resource references
+                if ext in {".md", ".py", ".sh", ".ts", ".yaml", ".yml"}:
                     self.check_documentation_decommissioned_resources(p)
 
-                # Check k8s manifests
-                posix_path = p.as_posix()
-                if ("iac/k8s" in posix_path or posix_path.startswith("ci/") or "/ci/" in posix_path) and ext in {".yaml", ".yml"}:
-                    # Skip archive directory
-                    if "archive" not in p.parts:
-                        self.check_k8s_manifest(p)
+                # Universal content-aware Kubernetes YAML manifest validation
+                if ext in {".yaml", ".yml"} and self.is_candidate_k8s_yaml(p):
+                    self.check_k8s_manifest(p)
 
-                # Check opnsense configs
+                # Check OPNsense XML firewall configs
                 if file.endswith(".xml") and "opnsense" in posix_path.lower():
                     self.check_opnsense_config(p)
 
-                # Check wrapper scripts for inline source duplication
+                # Check wrapper scripts for excessive inline duplication
                 if ext in {".ps1", ".sh"} and "scripts" in p.parts:
                     self.check_wrapper_duplication(p)
 
                 # Check Node.js / ESM files for syntax validity
-                if ext in {".mjs", ".js"} and any(part in p.parts for part in ("docker", "scripts", "apps")):
+                if ext in {".mjs", ".js"}:
                     self.check_node_syntax(p)
 
-        # Check master README.md coverage
         self.check_readme_coverage()
-
         return self.violations
 
     def check_flux_kustomization_readiness(self) -> List[InvariantViolation]:
-        """Verifies live FluxCD Kustomizations (cluster-apps, cluster-system) report Ready=True."""
+        """Verifies live FluxCD Kustomizations report Ready=True."""
         flux_violations: List[InvariantViolation] = []
-        kubeconfig_path = self.repo_root / "iac" / "tofu" / "k8s" / "kubeconfig"
-        if not kubeconfig_path.exists():
+        kubeconfig_path = self._resolve_kubeconfig_path()
+        if not kubeconfig_path:
             return flux_violations
+        temp_files: List[str] = []
         try:
-            import base64
-            import json
-            import ssl
-            import tempfile
-            import urllib.request
-
             kc_text = kubeconfig_path.read_text(encoding="utf-8")
-            server = re.search(r"server:\s*(\S+)", kc_text).group(1)
-            ca_b64 = re.search(r"certificate-authority-data:\s*(\S+)", kc_text).group(1)
-            cert_b64 = re.search(r"client-certificate-data:\s*(\S+)", kc_text).group(1)
-            key_b64 = re.search(r"client-key-data:\s*(\S+)", kc_text).group(1)
+            server, ctx, temp_files = self._with_k8s_ssl_context(kc_text)
+            if not server or not ctx:
+                return flux_violations
 
-            with tempfile.NamedTemporaryFile(delete=False) as ca_f, \
-                 tempfile.NamedTemporaryFile(delete=False) as cert_f, \
-                 tempfile.NamedTemporaryFile(delete=False) as key_f:
-                ca_f.write(base64.b64decode(ca_b64)); ca_f.flush()
-                cert_f.write(base64.b64decode(cert_b64)); cert_f.flush()
-                key_f.write(base64.b64decode(key_b64)); key_f.flush()
-                ctx = ssl.create_default_context(cafile=ca_f.name)
-                ctx.load_cert_chain(certfile=cert_f.name, keyfile=key_f.name)
-
-            import time
             items = []
             for attempt in range(4):
                 req = urllib.request.Request(f"{server}/apis/kustomize.toolkit.fluxcd.io/v1/namespaces/flux-system/kustomizations")
@@ -659,31 +719,10 @@ class InvariantLinter:
                     )
         except Exception:
             pass
+        finally:
+            for tf in temp_files:
+                try:
+                    os.unlink(tf)
+                except OSError:
+                    pass
         return flux_violations
-
-
-def main():
-    parser = argparse.ArgumentParser(description="VMG Systems Mechanical Invariant Linter")
-    parser.add_argument("--path", default=".", help="Root path to lint (default: current directory)")
-    parser.add_argument("--verbose", action="store_true", help="Print verbose output")
-    parser.add_argument("--verify-flux-sync", action="store_true", help="Verify live FluxCD Kustomizations are Ready=True")
-    args = parser.parse_args()
-
-    repo_root = Path(args.path).resolve()
-    linter = InvariantLinter(repo_root)
-    violations = linter.run()
-    if args.verify_flux_sync:
-        violations.extend(linter.check_flux_kustomization_readiness())
-
-    if violations:
-        print(f"FAILED: {len(violations)} architectural invariant violation(s) found:\n")
-        for v in violations:
-            print(f"  * {v}")
-        sys.exit(1)
-    else:
-        print("SUCCESS: All architectural invariants, zero-trust policies, and hygiene rules passed cleanly.")
-        sys.exit(0)
-
-
-if __name__ == "__main__":
-    main()

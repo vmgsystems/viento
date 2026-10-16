@@ -2,6 +2,14 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.2.0] - 2026-10-16
+
+### Added
+- **Universal Content-Aware Kubernetes YAML Discovery (`viento lint`):** Automatically detects and validates Kubernetes manifests (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `Secret`, `PersistentVolumeClaim`, `Canary`, `MetricTemplate`, `Provider`) across any directory (`clusters/`, `k8s/`, `manifests/`, `apps/`, `iac/k8s/`).
+- **Symmetric Apples-to-Apples Contention Benchmark (`viento bench`):** Reports both `autocommit_insert_ms`, `interleaved_query_ms`, and `batched_tx_ms` across identical SQL execution profiles in `DELETE_DEFAULT` and `WAL_TUNED` modes, plus PVC-backed Kubernetes benchmark Job template (`manifests/viento-bench-job.yaml`).
+- **PostgreSQL Cold-Archive & Bounded Decompression Support (`viento dr-drill`):** Added `pg_dump` (`.sql.gz` / `.sql`) verification, `2 GiB` streaming decompression ceiling against gzip bombs, and virtual-table resilience.
+- **Configurable `.viento.yaml` Schema:** Added `pvc_capacity_floors`, `privileged_allowlist`, `decommissioned_tokens`, and standard `KUBECONFIG` / `~/.kube/config` resolution with guaranteed temporary certificate file cleanup.
+
 ## [v0.1.0] - 2026-10-16
 
 ### Added

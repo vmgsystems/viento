@@ -1,8 +1,20 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: viento-bench-pvc
+  namespace: apps
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: viento-sqlite-bench
-  namespace: default
+  namespace: apps
 spec:
   ttlSecondsAfterFinished: 3600
   backoffLimit: 1
@@ -16,23 +28,33 @@ spec:
       containers:
         - name: bench
           image: python:3.11-slim
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           command:
             - python3
             - -c
             - |
               import sqlite3, time
-              for mode, wal in [("DELETE", False), ("WAL", True)]:
+              for mode, wal in [("DELETE_DEFAULT", False), ("WAL_TUNED", True)]:
                   conn = sqlite3.connect(f"/bench/{mode}.db", isolation_level=None)
                   if wal:
                       conn.execute("PRAGMA journal_mode=WAL;")
                       conn.execute("PRAGMA synchronous=NORMAL;")
                       conn.execute("PRAGMA cache_size=-64000;")
+                      conn.execute("PRAGMA mmap_size=268435456;")
+                  else:
+                      conn.execute("PRAGMA journal_mode=DELETE;")
+                      conn.execute("PRAGMA synchronous=FULL;")
                   conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);")
                   t0 = time.perf_counter()
                   for i in range(200):
                       conn.execute("INSERT INTO t (v) VALUES ('sample');")
                   dt = (time.perf_counter() - t0) * 1000.0
-                  print(f"{mode}: {dt:.2f} ms")
+                  print(f"{mode} (200 autocommit INSERTs): {dt:.2f} ms")
           resources:
             requests:
               cpu: 100m
@@ -45,4 +67,5 @@ spec:
               mountPath: /bench
       volumes:
         - name: bench-vol
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: viento-bench-pvc

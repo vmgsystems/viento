@@ -117,7 +117,7 @@ spec:
           - traefik
           - agent-sandbox
           names:
-          - "forgejo-runner*"
+          - "*-dind-runner*"
     validate:
       message: "Privileged mode and privilege escalation are strictly forbidden in the apps namespace."
       pattern:

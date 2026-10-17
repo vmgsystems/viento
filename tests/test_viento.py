@@ -20,7 +20,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.2.2"
+    assert __version__ == "0.2.3"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text
@@ -174,11 +174,27 @@ spec:
 
 
 def test_viento_linter_adversarial_hardening_regressions():
-    """Covers >8 KiB preamble comment padding, multi-doc SOPS smuggling, ephemeralContainers
-    latest/privileged checks, and multiline/unparenthesized PromQL rate division without > 0."""
+    """Covers >8 KiB preamble comment padding, root .sops.yaml exclusion, multi-doc & key-level SOPS smuggling,
+    uppercase :LATEST / malformed @sha256 digests, null/empty resource limits, string-quoted privilege,
+    glob privileged_allowlist across initContainers, and multiline PromQL rate division without > 0."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         (root / "README.md").write_text("# Adversarial Test Repo\n", encoding="utf-8")
+        # Root .sops.yaml creation rules config must NOT be flagged as an unencrypted secret
+        (root / ".sops.yaml").write_text(
+            """creation_rules:
+  - path_regex: .*\\.sops\\.ya?ml$
+    encrypted_regex: '^(data|stringData)$'
+    age: age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+""",
+            encoding="utf-8",
+        )
+        (root / ".viento.yaml").write_text(
+            """privileged_allowlist:
+  - "*-dind-runner*"
+""",
+            encoding="utf-8",
+        )
         k8s_dir = root / "manifests"
         k8s_dir.mkdir()
 
@@ -195,7 +211,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: nginx:latest
+          image: nginx:LATEST
           resources:
             requests:
               cpu: 10m
@@ -207,14 +223,16 @@ spec:
             encoding="utf-8",
         )
 
-        # 2. Multi-document .sops.yaml where Doc 1 is encrypted and Doc 2 is an unencrypted Secret
+        # 2. Multi-document .sops.yaml + key-level plaintext smuggling inside a Secret with sops.mac
         (k8s_dir / "smuggled.sops.yaml").write_text(
             """apiVersion: v1
 kind: Secret
 metadata:
-  name: encrypted-secret
+  name: partially-encrypted-secret
 data:
   token: ENC[AES256_GCM,data:aaaa,iv:bbbb,tag:cccc,type:str]
+stringData:
+  leaked_key: cleartext-secret-value
 sops:
   mac: ENC[AES256_GCM,data:xxxx,iv:yyyy,tag:zzzz,type:str]
 ---
@@ -228,7 +246,7 @@ stringData:
             encoding="utf-8",
         )
 
-        # 3. ephemeralContainers with :latest and privileged: true
+        # 3. ephemeralContainers with malformed @sha256 digest and string "true" privileged
         (k8s_dir / "ephemeral_pod.yaml").write_text(
             """apiVersion: v1
 kind: Pod
@@ -240,21 +258,58 @@ spec:
       image: alpine:3.20
       resources:
         requests:
-          cpu: 10m
-          memory: 32Mi
+          cpu: ""
+          memory: null
         limits:
           cpu: 100m
           memory: 64Mi
   ephemeralContainers:
     - name: debugger
-      image: busybox:latest
+      image: busybox@sha256:bad
       securityContext:
-        privileged: true
+        privileged: "true"
 """,
             encoding="utf-8",
         )
 
-        # 4. Multiline / unparenthesized PromQL rate division lacking > 0
+        # 4. Allowlisted *-dind-runner* with privileged initContainer must NOT be flagged
+        (k8s_dir / "allowed_runner.yaml").write_text(
+            """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-dind-runner
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: init-dind
+          image: docker:27.1.1-dind
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      containers:
+        - name: runner
+          image: docker:27.1.1-dind
+          securityContext:
+            privileged: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+""",
+            encoding="utf-8",
+        )
+
+        # 5. Multiline / unparenthesized PromQL rate division lacking > 0
         (k8s_dir / "unparenthesized_metric.yaml").write_text(
             """apiVersion: flagger.app/v1beta1
 kind: MetricTemplate
@@ -273,10 +328,16 @@ spec:
         violations = linter.run()
         by_file_and_rule = {(Path(v.file_path).name, v.rule) for v in violations}
 
+        assert (".sops.yaml", "SOPS_ENCRYPTION") not in by_file_and_rule
+        assert ("allowed_runner.yaml", "DISALLOW_PRIVILEGED_CONTAINERS") not in by_file_and_rule
         assert ("padded_deployment.yaml", "DISALLOW_LATEST_TAG") in by_file_and_rule
         assert ("smuggled.sops.yaml", "SOPS_ENCRYPTION") in by_file_and_rule
+        sops_msgs = [v.message for v in violations if Path(v.file_path).name == "smuggled.sops.yaml"]
+        assert any("stringData.leaked_key" in m for m in sops_msgs)
+        assert any("smuggled-plaintext-secret" in m for m in sops_msgs)
         assert ("ephemeral_pod.yaml", "DISALLOW_LATEST_TAG") in by_file_and_rule
         assert ("ephemeral_pod.yaml", "DISALLOW_PRIVILEGED_CONTAINERS") in by_file_and_rule
+        assert ("ephemeral_pod.yaml", "REQUIRE_RESOURCE_LIMITS") in by_file_and_rule
         assert ("unparenthesized_metric.yaml", "PROMQL_ZERO_DENOMINATOR_GUARD") in by_file_and_rule
 
 
@@ -316,13 +377,14 @@ def test_viento_dr_drill_sqlite_postgres_and_safety_ceiling():
             f_out.write(f_in.read())
         raw_db.unlink()
 
+        # Include a row starting with \.env to verify COPY block does not terminate prematurely
         pg_dump_sql = """-- PostgreSQL database dump
 CREATE TABLE public.workflows (
     id integer NOT NULL,
     name text NOT NULL
 );
 COPY public.workflows (id, name) FROM stdin;
-1\talert-triage
+\\.env\talert-triage
 2\tdr-verifier
 \\.
 -- PostgreSQL database dump complete
@@ -344,6 +406,20 @@ COPY public.workflows (id, name) FROM stdin;
         capped_res = verify_sqlite_archive(gz_db, max_uncompressed_bytes=128)
         assert capped_res.passed is False
         assert "exceeds safety ceiling" in capped_res.detail
+
+        # Truncated COPY block containing \.prefix row without real \. terminator must fail as truncated_copy
+        truncated_copy_prefix = base / "truncated_copy_prefix.sql"
+        truncated_copy_prefix.write_text(
+            """-- PostgreSQL database dump
+CREATE TABLE public.workflows (id integer NOT NULL, name text NOT NULL);
+COPY public.workflows (id, name) FROM stdin;
+\\.env\tspoofed-row-not-terminator
+""",
+            encoding="utf-8",
+        )
+        trunc_prefix_res = verify_postgres_sql_archive(truncated_copy_prefix)
+        assert trunc_prefix_res.passed is False
+        assert trunc_prefix_res.integrity_status == "truncated_copy"
 
         truncated_sql = base / "truncated_between_tables.sql"
         truncated_sql.write_text(

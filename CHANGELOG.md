@@ -2,6 +2,16 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.2.3] - 2026-10-17
+
+### Security & Adversarial Hardening
+- **Root `.sops.yaml` / `.sops.yml` Configuration Exclusion Order (`viento lint`):** Fixed candidate YAML ordering in `is_candidate_k8s_yaml` so root SOPS configuration files (`.sops.yaml`, `.sops.yml`) are excluded before `.endswith((".sops.yaml", ".sops.yml"))` evaluation.
+- **SOPS Key-Level `ENC[...]` Ciphertext Verification (`viento lint`):** Enforced per-key `ENC[...]` prefix validation across `data` and `stringData` mappings inside `.sops.yaml` `Secret` documents so unencrypted cleartext keys cannot be smuggled inside documents carrying a `sops.mac` block.
+- **Case-Insensitive `:LATEST` & `@sha256` Digest Format Validation (`viento lint`):** Hardened `DISALLOW_LATEST_TAG` against uppercase `:LATEST`, `:latest@`, trailing `@`, and malformed `@sha256` digests lacking a 64-hex digest.
+- **Null/Empty Resource Specs & String-Quoted Privilege Guards (`viento lint`):** Hardened `REQUIRE_RESOURCE_LIMITS` against `null` or empty-string `requests`/`limits` and `DISALLOW_PRIVILEGED_CONTAINERS` against string-quoted `"true"`, while normalizing ` (init)`/` (ephemeral)` suffixes and supporting `fnmatch` wildcard patterns in `privileged_allowlist`.
+- **PostgreSQL `COPY` Exact Terminator & SQLite Multi-Row Integrity Checks (`viento dr-drill`):** Fixed `verify_postgres_sql_archive` to require exact `\.` line termination (`line.rstrip("\r\n") == "\\."`) so `COPY` rows starting with `\.` do not prematurely close the data block, and updated `verify_sqlite_archive` to fail on multi-row `PRAGMA integrity_check` errors or unreadable non-virtual tables.
+- **4-Phase In-Cluster Benchmark Job (`manifests/viento-bench-job.yaml`):** Upgraded the Kubernetes benchmark `Job` to run all 4 symmetric contention phases (`autocommit_insert_ms`, `interleaved_query_ms`, `batched_tx_ms`, `concurrent_rw_ms` with `threading.Barrier(2)`) and emit structured JSON telemetry.
+
 ## [v0.2.2] - 2026-10-16
 
 ### Security & Adversarial Hardening

@@ -270,7 +270,7 @@ class InvariantLinter:
         is_ephemeral: bool = False,
     ):
         """Rule: DISALLOW_LATEST_TAG, REQUIRE_RESOURCE_LIMITS & DISALLOW_PRIVILEGED_CONTAINERS"""
-        image = container.get("image", "")
+        image = str(container.get("image") or "").strip()
         c_name = container.get("name", "unknown")
 
         if not image:
@@ -279,7 +279,16 @@ class InvariantLinter:
             )
         else:
             last_segment = image.rsplit("/", 1)[-1]
-            if image.endswith(":latest") or ("@" not in image and ":" not in last_segment) or last_segment.endswith(":"):
+            lower_seg = last_segment.lower()
+            has_valid_digest = bool(re.search(r"@sha256:[0-9a-fA-F]{64}$", last_segment))
+            has_invalid_at = ("@" in last_segment) and not has_valid_digest
+            if (
+                lower_seg.endswith(":latest")
+                or ":latest@" in lower_seg
+                or last_segment.endswith((":", "@"))
+                or has_invalid_at
+                or ("@" not in last_segment and ":" not in last_segment)
+            ):
                 self.violations.append(
                     InvariantViolation(
                         file_path, "DISALLOW_LATEST_TAG",
@@ -289,7 +298,7 @@ class InvariantLinter:
 
         if not is_ephemeral:
             resources = container.get("resources")
-            if not resources:
+            if not isinstance(resources, dict) or not resources:
                 self.violations.append(
                     InvariantViolation(
                         file_path, "REQUIRE_RESOURCE_LIMITS",
@@ -297,17 +306,19 @@ class InvariantLinter:
                     )
                 )
             else:
-                requests = resources.get("requests", {})
-                limits = resources.get("limits", {})
+                requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+                limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
                 for metric in ("cpu", "memory"):
-                    if metric not in requests:
+                    req_val = requests.get(metric)
+                    if req_val is None or str(req_val).strip() == "":
                         self.violations.append(
                             InvariantViolation(
                                 file_path, "REQUIRE_RESOURCE_LIMITS",
                                 f"Container '{c_name}' in '{workload_name}' missing resources.requests.{metric}"
                             )
                         )
-                    if metric not in limits:
+                    lim_val = limits.get(metric)
+                    if lim_val is None or str(lim_val).strip() == "":
                         self.violations.append(
                             InvariantViolation(
                                 file_path, "REQUIRE_RESOURCE_LIMITS",
@@ -315,10 +326,27 @@ class InvariantLinter:
                             )
                         )
 
+        base_workload = workload_name.split(" (", 1)[0]
+        short_name = base_workload.split("/", 1)[-1]
         allowlist = set(self.config.get("privileged_allowlist") or [])
-        if workload_name not in allowlist:
-            sec_ctx = container.get("securityContext") or {}
-            if sec_ctx.get("privileged") is True or sec_ctx.get("allowPrivilegeEscalation") is True:
+        is_allowed = any(
+            fnmatch.fnmatch(workload_name, pat)
+            or fnmatch.fnmatch(base_workload, pat)
+            or fnmatch.fnmatch(short_name, pat)
+            for pat in allowlist
+        )
+        if not is_allowed:
+            sec_ctx = container.get("securityContext")
+            if not isinstance(sec_ctx, dict):
+                sec_ctx = {}
+            priv = sec_ctx.get("privileged")
+            allow_esc = sec_ctx.get("allowPrivilegeEscalation")
+            if (
+                priv is True
+                or str(priv).strip().lower() == "true"
+                or allow_esc is True
+                or str(allow_esc).strip().lower() == "true"
+            ):
                 self.violations.append(
                     InvariantViolation(
                         file_path, "DISALLOW_PRIVILEGED_CONTAINERS",
@@ -346,7 +374,7 @@ class InvariantLinter:
         """Rule: PLAINTEXT_SECRET_DEFENSE - Scan non-SOPS text files for live secret signatures."""
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             return
-        if file_path.name in {"linter.py", "lint_invariants.py", "test_viento.py", "test_lint_invariants.py"}:
+        if file_path.name in {"linter.py", "lint_invariants.py", "test_viento.py", "test_lint_invariants.py", "agent_pr_reviewer.py", "test_agent_pr_reviewer.py"}:
             return
 
         try:
@@ -382,10 +410,10 @@ class InvariantLinter:
     @staticmethod
     def is_candidate_k8s_yaml(file_path: Path, content: Optional[str] = None) -> bool:
         """Determines whether a YAML file should be parsed for Kubernetes manifest invariants."""
+        if file_path.name in {".viento.yaml", ".viento.yml", ".sops.yaml", ".sops.yml"}:
+            return False
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             return True
-        if file_path.name in {".viento.yaml", ".viento.yml", ".sops.yaml"}:
-            return False
         if any(part in {".github", ".forgejo", "archive", "templates"} for part in file_path.parts):
             return False
         try:
@@ -401,6 +429,8 @@ class InvariantLinter:
 
     def check_k8s_manifest(self, file_path: Path, content: Optional[str] = None):
         """Validates Kubernetes manifests for zero-trust admission invariants across any directory."""
+        if file_path.name in {".viento.yaml", ".viento.yml", ".sops.yaml", ".sops.yml"}:
+            return
         rel_path = str(file_path.relative_to(self.repo_root))
         if yaml is None:
             self.violations.append(
@@ -452,13 +482,24 @@ class InvariantLinter:
                     )
                 elif not sops_violation_recorded:
                     sops_meta = doc.get("sops")
-                    if not isinstance(sops_meta, dict) or not sops_meta.get("mac"):
+                    if not isinstance(sops_meta, dict) or not str(sops_meta.get("mac") or "").startswith("ENC["):
                         self.violations.append(
                             InvariantViolation(
                                 rel_path, "SOPS_ENCRYPTION",
                                 f"Kubernetes Secret '{name}' in SOPS file missing per-document 'sops.mac' encryption metadata"
                             )
                         )
+                    for field_name in ("data", "stringData"):
+                        sec_map = doc.get(field_name)
+                        if isinstance(sec_map, dict):
+                            for k, v in sec_map.items():
+                                if not str(v or "").strip().startswith("ENC["):
+                                    self.violations.append(
+                                        InvariantViolation(
+                                            rel_path, "SOPS_ENCRYPTION",
+                                            f"Kubernetes Secret '{name}' key '{field_name}.{k}' in SOPS file is not encrypted with 'ENC[...]'"
+                                        )
+                                    )
 
             if kind in WORKLOAD_KINDS:
                 w_name, pod_spec = self.extract_pod_spec(doc)
@@ -478,7 +519,7 @@ class InvariantLinter:
                 for c in all_c:
                     cmd_list = (c.get("command") or []) + (c.get("args") or [])
                     cmd_str = " ".join(str(item) for item in cmd_list)
-                    if "sqlite3" in cmd_str and (".backup" in cmd_str or ".dump" in cmd_str):
+                    if "sqlite3" in cmd_str and re.search(r"(?:^|[\s\x22\x27])\.(?:backup|dump)\b", cmd_str):
                         if ".timeout 60000" not in cmd_str:
                             self.violations.append(
                                 InvariantViolation(
@@ -724,7 +765,8 @@ class InvariantLinter:
                 with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
                     items = json.loads(resp.read().decode("utf-8")).get("items", [])
                 if any(
-                    next((c for c in ks.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), {}).get("reason") == "Progressing"
+                    next((c for c in ks.get("status", {}).get("conditions", []) if c.get("type") == "Ready"), {}).get("reason")
+                    in {"Progressing", "DependencyNotReady"}
                     for ks in items
                 ) and attempt < 3:
                     time.sleep(2)

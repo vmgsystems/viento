@@ -61,12 +61,14 @@ def verify_sqlite_archive(
 
             conn = sqlite3.connect(str(tmp_db))
             try:
-                integrity = conn.execute("PRAGMA integrity_check;").fetchone()[0]
+                integrity_rows = [str(r[0]) for r in conn.execute("PRAGMA integrity_check;").fetchall()]
+                integrity = integrity_rows[0] if len(integrity_rows) == 1 else "; ".join(integrity_rows)
                 rows = conn.execute(
                     "SELECT name, COALESCE(sql, '') FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';"
                 ).fetchall()
                 tables = [r[0] for r in rows]
                 total_rows = 0
+                table_read_errors = []
                 for tbl_name, create_sql in rows:
                     if create_sql.strip().upper().startswith("CREATE VIRTUAL TABLE"):
                         continue
@@ -74,16 +76,27 @@ def verify_sqlite_archive(
                     try:
                         cnt = conn.execute(f'SELECT COUNT(*) FROM "{safe_tbl}";').fetchone()[0]
                         total_rows += int(cnt)
-                    except sqlite3.OperationalError:
-                        continue
-                passed = integrity.lower() == "ok" and len(tables) > 0
+                    except sqlite3.Error as tbl_exc:
+                        table_read_errors.append(f"{tbl_name}: {tbl_exc}")
+                passed = (
+                    len(integrity_rows) == 1
+                    and integrity.lower() == "ok"
+                    and len(tables) > 0
+                    and not table_read_errors
+                )
+                if passed:
+                    detail = "OK"
+                elif table_read_errors:
+                    detail = f"Unreadable table(s): {'; '.join(table_read_errors)}"
+                else:
+                    detail = "Integrity or empty-schema failure"
                 return ArchiveDrillResult(
                     archive_name=archive_path.name,
                     passed=passed,
-                    integrity_status=integrity,
+                    integrity_status=integrity if not table_read_errors else "corrupt_table",
                     table_count=len(tables),
                     total_rows=total_rows,
-                    detail="OK" if passed else "Integrity or empty-schema failure",
+                    detail=detail,
                 )
             finally:
                 conn.close()
@@ -136,7 +149,7 @@ def verify_postgres_sql_archive(
                 if total_bytes > max_uncompressed_bytes:
                     raise ValueError(f"Decompressed SQL dump exceeds safety ceiling ({max_uncompressed_bytes} bytes)")
                 if in_copy_block:
-                    if line.startswith("\\."):
+                    if line.rstrip("\r\n") == "\\.":
                         in_copy_block = False
                     else:
                         row_count += 1

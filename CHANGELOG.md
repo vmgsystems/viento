@@ -2,6 +2,16 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.2.2] - 2026-10-16
+
+### Security & Adversarial Hardening
+- **Expanded Kubernetes YAML Candidate Preamble Scan Window (`viento lint`):** Increased `is_candidate_k8s_yaml` header inspection window from `8 KiB` to `1 MiB` (`1,048,576` bytes) to prevent comment-padding evasion before `apiVersion:` and `kind:` declarations.
+- **Per-Document SOPS MAC Verification (`viento lint`):** Enforced per-document `sops.mac` verification across multi-document YAML streams (`---`) in `SOPS_ENCRYPTION` so plaintext `Secret` manifests cannot be smuggled alongside an encrypted document.
+- **Ephemeral Container Security & Entrypoint Hygiene (`viento lint`):** Added `ephemeralContainers` inspection for `DISALLOW_LATEST_TAG`, `DISALLOW_PRIVILEGED_CONTAINERS`, and entrypoint command hygiene, achieving full parity with `policies/kyverno-zero-trust.yaml`.
+- **Generalized PromQL Zero-Denominator Guard (`viento lint`):** Upgraded `PROMQL_ZERO_DENOMINATOR_GUARD` detection via regex (`/\s*\(?\s*(?:sum\s*\(\s*)?rate\s*\(`) to catch multiline and unparenthesized rate divisions lacking `> 0`.
+- **Truncated `pg_dump` Early-`COMMIT;` Latch & Uncompressed Ceiling Guards (`viento dr-drill`):** Hardened `verify_postgres_sql_archive` against early `COMMIT;` latch spoofing on truncated `pg_dump` streams and enforced `max_uncompressed_bytes` prior to copying uncompressed `.sqlite3`, `.db`, and `.sql` archives.
+- **Multi-Threaded Concurrent Contention Phase & Boundary Validation (`viento bench` / `viento dr-drill`):** Added Phase 4 true multi-threaded concurrent reader + writer lock contention benchmarking (`concurrent_rw_ms` with `threading.Barrier(2)`) and strict boundary validation (`iterations >= 1`, `max_size_mb >= 1`).
+
 ## [v0.2.1] - 2026-10-16
 
 ### Fixed & Changed

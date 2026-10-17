@@ -52,6 +52,11 @@ def verify_sqlite_archive(
             if archive_path.name.endswith(".gz"):
                 _stream_decompress_bounded(archive_path, tmp_db, max_bytes=max_uncompressed_bytes)
             else:
+                raw_size = archive_path.stat().st_size
+                if raw_size > max_uncompressed_bytes:
+                    raise ValueError(
+                        f"Uncompressed archive size ({raw_size} bytes) exceeds safety ceiling ({max_uncompressed_bytes} bytes)"
+                    )
                 shutil.copy2(archive_path, tmp_db)
 
             conn = sqlite3.connect(str(tmp_db))
@@ -100,14 +105,27 @@ def verify_postgres_sql_archive(
 ) -> ArchiveDrillResult:
     """Verifies a PostgreSQL pg_dump (.sql or .sql.gz) archive for decompression, schema DDL, and completion markers."""
     try:
+        if not archive_path.name.endswith(".gz"):
+            raw_size = archive_path.stat().st_size
+            if raw_size > max_uncompressed_bytes:
+                raise ValueError(
+                    f"Uncompressed SQL dump size ({raw_size} bytes) exceeds safety ceiling ({max_uncompressed_bytes} bytes)"
+                )
+
         total_bytes = 0
         table_count = 0
         row_count = 0
         in_copy_block = False
+        has_pg_dump_header = False
         has_completion_footer = False
         create_table_re = re.compile(r"^\s*CREATE\s+TABLE\b", re.IGNORECASE)
         insert_re = re.compile(r"^\s*INSERT\s+INTO\b", re.IGNORECASE)
         copy_re = re.compile(r"^\s*COPY\s+\S+.*FROM\s+stdin;", re.IGNORECASE)
+        commit_re = re.compile(r"^\s*COMMIT\s*;\s*$", re.IGNORECASE)
+        ddl_dml_re = re.compile(
+            r"^\s*(CREATE|INSERT|COPY|ALTER|DROP|SET|BEGIN|SELECT|UPDATE|DELETE)\b",
+            re.IGNORECASE,
+        )
 
         opener = (lambda p: gzip.open(p, "rt", encoding="utf-8", errors="replace")) if archive_path.name.endswith(".gz") else (
             lambda p: open(p, "r", encoding="utf-8", errors="replace")
@@ -123,14 +141,24 @@ def verify_postgres_sql_archive(
                     else:
                         row_count += 1
                     continue
+                if "PostgreSQL database dump" in line and "complete" not in line:
+                    has_pg_dump_header = True
                 if create_table_re.search(line):
                     table_count += 1
+                    has_completion_footer = False
                 elif copy_re.search(line):
                     in_copy_block = True
+                    has_completion_footer = False
                 elif insert_re.search(line):
                     row_count += 1
-                elif "PostgreSQL database dump complete" in line or "COMMIT;" in line:
+                    has_completion_footer = False
+                elif "PostgreSQL database dump complete" in line:
                     has_completion_footer = True
+                elif commit_re.match(line):
+                    if not has_pg_dump_header:
+                        has_completion_footer = True
+                elif ddl_dml_re.search(line):
+                    has_completion_footer = False
 
         passed = table_count > 0 and not in_copy_block and (has_completion_footer or not require_completion_footer)
         if in_copy_block:

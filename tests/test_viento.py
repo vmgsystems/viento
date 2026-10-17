@@ -5,6 +5,8 @@ import sqlite3
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from viento import __version__
 from viento.bench import run_sqlite_contention_benchmark
 from viento.cli import main
@@ -18,7 +20,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.2.1"
+    assert __version__ == "0.2.2"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text
@@ -171,15 +173,126 @@ spec:
         assert "PROMQL_ZERO_DENOMINATOR_GUARD" in rules
 
 
+def test_viento_linter_adversarial_hardening_regressions():
+    """Covers >8 KiB preamble comment padding, multi-doc SOPS smuggling, ephemeralContainers
+    latest/privileged checks, and multiline/unparenthesized PromQL rate division without > 0."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "README.md").write_text("# Adversarial Test Repo\n", encoding="utf-8")
+        k8s_dir = root / "manifests"
+        k8s_dir.mkdir()
+
+        # 1. >8 KiB comment preamble before a violating Deployment
+        preamble = "# " + ("A" * 9000) + "\n"
+        (k8s_dir / "padded_deployment.yaml").write_text(
+            preamble
+            + """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: padded-evasion
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          image: nginx:latest
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+""",
+            encoding="utf-8",
+        )
+
+        # 2. Multi-document .sops.yaml where Doc 1 is encrypted and Doc 2 is an unencrypted Secret
+        (k8s_dir / "smuggled.sops.yaml").write_text(
+            """apiVersion: v1
+kind: Secret
+metadata:
+  name: encrypted-secret
+data:
+  token: ENC[AES256_GCM,data:aaaa,iv:bbbb,tag:cccc,type:str]
+sops:
+  mac: ENC[AES256_GCM,data:xxxx,iv:yyyy,tag:zzzz,type:str]
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: smuggled-plaintext-secret
+stringData:
+  password: cleartext-value
+""",
+            encoding="utf-8",
+        )
+
+        # 3. ephemeralContainers with :latest and privileged: true
+        (k8s_dir / "ephemeral_pod.yaml").write_text(
+            """apiVersion: v1
+kind: Pod
+metadata:
+  name: debug-pod
+spec:
+  containers:
+    - name: main
+      image: alpine:3.20
+      resources:
+        requests:
+          cpu: 10m
+          memory: 32Mi
+        limits:
+          cpu: 100m
+          memory: 64Mi
+  ephemeralContainers:
+    - name: debugger
+      image: busybox:latest
+      securityContext:
+        privileged: true
+""",
+            encoding="utf-8",
+        )
+
+        # 4. Multiline / unparenthesized PromQL rate division lacking > 0
+        (k8s_dir / "unparenthesized_metric.yaml").write_text(
+            """apiVersion: flagger.app/v1beta1
+kind: MetricTemplate
+metadata:
+  name: multiline-metric
+spec:
+  query: |
+    sum(rate(traefik_service_requests_total{service=~".*{{ target }}.*", code!~"5.*"}[1m]))
+    /
+    sum(rate(traefik_service_requests_total{service=~".*{{ target }}.*"}[1m])) * 100
+""",
+            encoding="utf-8",
+        )
+
+        linter = InvariantLinter(root)
+        violations = linter.run()
+        by_file_and_rule = {(Path(v.file_path).name, v.rule) for v in violations}
+
+        assert ("padded_deployment.yaml", "DISALLOW_LATEST_TAG") in by_file_and_rule
+        assert ("smuggled.sops.yaml", "SOPS_ENCRYPTION") in by_file_and_rule
+        assert ("ephemeral_pod.yaml", "DISALLOW_LATEST_TAG") in by_file_and_rule
+        assert ("ephemeral_pod.yaml", "DISALLOW_PRIVILEGED_CONTAINERS") in by_file_and_rule
+        assert ("unparenthesized_metric.yaml", "PROMQL_ZERO_DENOMINATOR_GUARD") in by_file_and_rule
+
+
 def test_viento_bench_symmetric_methodology():
+    with pytest.raises(ValueError, match="iterations must be >= 1"):
+        run_sqlite_contention_benchmark(iterations=0)
+
     report = run_sqlite_contention_benchmark(iterations=40)
     assert report["methodology"] == "symmetric-autocommit-and-batched"
     assert report["iterations"] == 40
-    for key in ("autocommit_insert_ms", "interleaved_query_ms", "batched_tx_ms", "total_ms"):
+    for key in ("autocommit_insert_ms", "interleaved_query_ms", "batched_tx_ms", "concurrent_rw_ms", "total_ms"):
         assert report["wal_tuned"][key] >= 0
         assert report["delete_default"][key] >= 0
     assert report["speedup_factor"] > 0
     assert report["autocommit_speedup_factor"] > 0
+    assert report["concurrent_rw_speedup_factor"] > 0
 
 
 def test_viento_dr_drill_sqlite_postgres_and_safety_ceiling():
@@ -192,6 +305,11 @@ def test_viento_dr_drill_sqlite_postgres_and_safety_ceiling():
         conn.execute("INSERT INTO monitors (name) VALUES ('api-gateway');")
         conn.commit()
         conn.close()
+
+        # Verify uncompressed .sqlite3 exceeding max_uncompressed_bytes fails prior to copy
+        uncompressed_capped = verify_sqlite_archive(raw_db, max_uncompressed_bytes=128)
+        assert uncompressed_capped.passed is False
+        assert "exceeds safety ceiling" in uncompressed_capped.detail
 
         gz_db = base / "sample.sqlite3.gz"
         with open(raw_db, "rb") as f_in, gzip.open(gz_db, "wb") as f_out:
@@ -240,3 +358,19 @@ COPY public.workflows (id, name) FROM stdin;
         trunc_res = verify_postgres_sql_archive(truncated_sql)
         assert trunc_res.passed is False
         assert trunc_res.integrity_status == "missing_completion_footer"
+
+        # Verify early COMMIT; in a truncated pg_dump file does not spoof completion footer
+        early_commit_sql = base / "truncated_early_commit.sql"
+        early_commit_sql.write_text(
+            """-- PostgreSQL database dump
+BEGIN;
+CREATE TABLE public.workflows (id integer NOT NULL, name text NOT NULL);
+INSERT INTO public.workflows VALUES (1, 'alert-triage');
+COMMIT;
+-- Mid-stream connection reset before final dump footer
+""",
+            encoding="utf-8",
+        )
+        early_commit_res = verify_postgres_sql_archive(early_commit_sql)
+        assert early_commit_res.passed is False
+        assert early_commit_res.integrity_status == "missing_completion_footer"

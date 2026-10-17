@@ -262,7 +262,13 @@ class InvariantLinter:
                 except OSError:
                     pass
 
-    def check_k8s_container_spec(self, container: Dict[str, Any], file_path: str, workload_name: str):
+    def check_k8s_container_spec(
+        self,
+        container: Dict[str, Any],
+        file_path: str,
+        workload_name: str,
+        is_ephemeral: bool = False,
+    ):
         """Rule: DISALLOW_LATEST_TAG, REQUIRE_RESOURCE_LIMITS & DISALLOW_PRIVILEGED_CONTAINERS"""
         image = container.get("image", "")
         c_name = container.get("name", "unknown")
@@ -281,32 +287,33 @@ class InvariantLinter:
                     )
                 )
 
-        resources = container.get("resources")
-        if not resources:
-            self.violations.append(
-                InvariantViolation(
-                    file_path, "REQUIRE_RESOURCE_LIMITS",
-                    f"Container '{c_name}' in '{workload_name}' missing 'resources' spec"
+        if not is_ephemeral:
+            resources = container.get("resources")
+            if not resources:
+                self.violations.append(
+                    InvariantViolation(
+                        file_path, "REQUIRE_RESOURCE_LIMITS",
+                        f"Container '{c_name}' in '{workload_name}' missing 'resources' spec"
+                    )
                 )
-            )
-        else:
-            requests = resources.get("requests", {})
-            limits = resources.get("limits", {})
-            for metric in ("cpu", "memory"):
-                if metric not in requests:
-                    self.violations.append(
-                        InvariantViolation(
-                            file_path, "REQUIRE_RESOURCE_LIMITS",
-                            f"Container '{c_name}' in '{workload_name}' missing resources.requests.{metric}"
+            else:
+                requests = resources.get("requests", {})
+                limits = resources.get("limits", {})
+                for metric in ("cpu", "memory"):
+                    if metric not in requests:
+                        self.violations.append(
+                            InvariantViolation(
+                                file_path, "REQUIRE_RESOURCE_LIMITS",
+                                f"Container '{c_name}' in '{workload_name}' missing resources.requests.{metric}"
+                            )
                         )
-                    )
-                if metric not in limits:
-                    self.violations.append(
-                        InvariantViolation(
-                            file_path, "REQUIRE_RESOURCE_LIMITS",
-                            f"Container '{c_name}' in '{workload_name}' missing resources.limits.{metric}"
+                    if metric not in limits:
+                        self.violations.append(
+                            InvariantViolation(
+                                file_path, "REQUIRE_RESOURCE_LIMITS",
+                                f"Container '{c_name}' in '{workload_name}' missing resources.limits.{metric}"
+                            )
                         )
-                    )
 
         allowlist = set(self.config.get("privileged_allowlist") or [])
         if workload_name not in allowlist:
@@ -335,7 +342,7 @@ class InvariantLinter:
             return name, template.get("spec") or {}
         return name, {}
 
-    def check_plaintext_secrets(self, file_path: Path):
+    def check_plaintext_secrets(self, file_path: Path, content: Optional[str] = None):
         """Rule: PLAINTEXT_SECRET_DEFENSE - Scan non-SOPS text files for live secret signatures."""
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             return
@@ -348,25 +355,32 @@ class InvariantLinter:
             rel_path = str(file_path)
 
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line_idx, line in enumerate(f, start=1):
-                    if "FIXTURE_ALLOW_SECRET" in line:
-                        continue
-                    for pattern, secret_type in SECRET_PATTERNS:
-                        if pattern.search(line):
-                            self.violations.append(
-                                InvariantViolation(
-                                    file_path=rel_path,
-                                    rule="PLAINTEXT_SECRET_DEFENSE",
-                                    message=f"Live {secret_type} signature detected in plaintext file",
-                                    line_number=line_idx
-                                )
+            text = content if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+            matched_patterns = [
+                (pattern, secret_type)
+                for pattern, secret_type in SECRET_PATTERNS
+                if pattern.search(text)
+            ]
+            if not matched_patterns:
+                return
+            for line_idx, line in enumerate(text.splitlines(), start=1):
+                if "FIXTURE_ALLOW_SECRET" in line:
+                    continue
+                for pattern, secret_type in matched_patterns:
+                    if pattern.search(line):
+                        self.violations.append(
+                            InvariantViolation(
+                                file_path=rel_path,
+                                rule="PLAINTEXT_SECRET_DEFENSE",
+                                message=f"Live {secret_type} signature detected in plaintext file",
+                                line_number=line_idx
                             )
+                        )
         except Exception:
             pass
 
     @staticmethod
-    def is_candidate_k8s_yaml(file_path: Path) -> bool:
+    def is_candidate_k8s_yaml(file_path: Path, content: Optional[str] = None) -> bool:
         """Determines whether a YAML file should be parsed for Kubernetes manifest invariants."""
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
             return True
@@ -375,12 +389,17 @@ class InvariantLinter:
         if any(part in {".github", ".forgejo", "archive", "templates"} for part in file_path.parts):
             return False
         try:
-            head = file_path.read_text(encoding="utf-8", errors="ignore")[:8192]
-            return ("apiVersion:" in head and "kind:" in head)
+            max_scan_bytes = 1024 * 1024
+            if content is not None:
+                text = content[:max_scan_bytes]
+            else:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    text = f.read(max_scan_bytes)
+            return ("apiVersion:" in text and "kind:" in text)
         except Exception:
             return False
 
-    def check_k8s_manifest(self, file_path: Path):
+    def check_k8s_manifest(self, file_path: Path, content: Optional[str] = None):
         """Validates Kubernetes manifests for zero-trust admission invariants across any directory."""
         rel_path = str(file_path.relative_to(self.repo_root))
         if yaml is None:
@@ -389,11 +408,12 @@ class InvariantLinter:
             )
             return
 
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception:
-            return
+        if content is None:
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                return
 
         sops_violation_recorded = False
         if file_path.name.endswith((".sops.yaml", ".sops.yml")):
@@ -422,28 +442,39 @@ class InvariantLinter:
             meta = doc.get("metadata") or {}
             name = meta.get("name", "unnamed")
 
-            if kind == "Secret" and not sops_violation_recorded:
+            if kind == "Secret":
                 if not file_path.name.endswith((".sops.yaml", ".sops.yml")):
                     self.violations.append(
-                        InvariantViolation(rel_path, "SOPS_ENCRYPTION", "Kubernetes Secret must be stored in encrypted .sops.yaml file")
+                        InvariantViolation(
+                            rel_path, "SOPS_ENCRYPTION",
+                            f"Kubernetes Secret '{name}' must be stored in encrypted .sops.yaml file"
+                        )
                     )
-                    sops_violation_recorded = True
-                elif "sops:" not in content or "mac:" not in content:
-                    self.violations.append(
-                        InvariantViolation(rel_path, "SOPS_ENCRYPTION", "SOPS secret file missing 'sops:' or 'mac:' encryption markers")
-                    )
-                    sops_violation_recorded = True
+                elif not sops_violation_recorded:
+                    sops_meta = doc.get("sops")
+                    if not isinstance(sops_meta, dict) or not sops_meta.get("mac"):
+                        self.violations.append(
+                            InvariantViolation(
+                                rel_path, "SOPS_ENCRYPTION",
+                                f"Kubernetes Secret '{name}' in SOPS file missing per-document 'sops.mac' encryption metadata"
+                            )
+                        )
 
             if kind in WORKLOAD_KINDS:
                 w_name, pod_spec = self.extract_pod_spec(doc)
                 containers = pod_spec.get("containers") or []
                 init_containers = pod_spec.get("initContainers") or []
+                ephemeral_containers = pod_spec.get("ephemeralContainers") or []
                 for c in containers:
                     self.check_k8s_container_spec(c, rel_path, f"{kind}/{w_name}")
                 for c in init_containers:
                     self.check_k8s_container_spec(c, rel_path, f"{kind}/{w_name} (init)")
+                for c in ephemeral_containers:
+                    self.check_k8s_container_spec(
+                        c, rel_path, f"{kind}/{w_name} (ephemeral)", is_ephemeral=True
+                    )
 
-                all_c = containers + init_containers
+                all_c = containers + init_containers + ephemeral_containers
                 for c in all_c:
                     cmd_list = (c.get("command") or []) + (c.get("args") or [])
                     cmd_str = " ".join(str(item) for item in cmd_list)
@@ -486,7 +517,7 @@ class InvariantLinter:
                             )
                         )
                 if "/" in query and "rate(" in query:
-                    if "/ (sum(rate(" in query and "> 0" not in query:
+                    if re.search(r"/\s*\(?\s*(?:sum\s*\(\s*)?rate\s*\(", query) and "> 0" not in query:
                         self.violations.append(
                             InvariantViolation(
                                 rel_path, "PROMQL_ZERO_DENOMINATOR_GUARD",
@@ -572,7 +603,7 @@ class InvariantLinter:
         except Exception:
             pass
 
-    def check_documentation_decommissioned_resources(self, file_path: Path):
+    def check_documentation_decommissioned_resources(self, file_path: Path, content: Optional[str] = None):
         """Rule: DECOMMISSIONED_RESOURCE_LEAK - Optional via .viento.yaml decommissioned_tokens."""
         tokens = self.config.get("decommissioned_tokens") or []
         if not tokens or not isinstance(tokens, list):
@@ -584,20 +615,20 @@ class InvariantLinter:
             "purged", "stopped", "deprecated", "timeline", "completed"
         }
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line_idx, line in enumerate(f, start=1):
-                    lower = line.lower()
-                    for tok in tokens:
-                        tok_str = str(tok).lower()
-                        if tok_str and tok_str in lower and not any(q in lower for q in qualifiers):
-                            self.violations.append(
-                                InvariantViolation(
-                                    file_path=rel_path,
-                                    rule="DECOMMISSIONED_RESOURCE_LEAK",
-                                    message=f"Referencing decommissioned resource '{tok}' without decommissioning qualifier",
-                                    line_number=line_idx
-                                )
+            text = content if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+            for line_idx, line in enumerate(text.splitlines(), start=1):
+                lower = line.lower()
+                for tok in tokens:
+                    tok_str = str(tok).lower()
+                    if tok_str and tok_str in lower and not any(q in lower for q in qualifiers):
+                        self.violations.append(
+                            InvariantViolation(
+                                file_path=rel_path,
+                                rule="DECOMMISSIONED_RESOURCE_LEAK",
+                                message=f"Referencing decommissioned resource '{tok}' without decommissioning qualifier",
+                                line_number=line_idx
                             )
+                        )
         except Exception:
             pass
 
@@ -648,14 +679,19 @@ class InvariantLinter:
                 ext = p.suffix.lower()
                 posix_path = p.as_posix()
 
+                content: Optional[str] = None
                 if ext in TEXT_EXTENSIONS or file in {"Dockerfile", "Makefile"}:
-                    self.check_plaintext_secrets(p)
+                    try:
+                        content = p.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        content = None
+                    self.check_plaintext_secrets(p, content=content)
 
                 if ext in {".md", ".py", ".sh", ".ts", ".yaml", ".yml"}:
-                    self.check_documentation_decommissioned_resources(p)
+                    self.check_documentation_decommissioned_resources(p, content=content)
 
-                if ext in {".yaml", ".yml"} and self.is_candidate_k8s_yaml(p):
-                    self.check_k8s_manifest(p)
+                if ext in {".yaml", ".yml"} and self.is_candidate_k8s_yaml(p, content=content):
+                    self.check_k8s_manifest(p, content=content)
 
                 if file.endswith(".xml") and "opnsense" in posix_path.lower():
                     self.check_opnsense_config(p)

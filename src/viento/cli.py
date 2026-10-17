@@ -41,6 +41,9 @@ def cmd_lint(args: argparse.Namespace) -> int:
 
 
 def cmd_bench(args: argparse.Namespace) -> int:
+    if int(getattr(args, "iterations", 100)) < 1:
+        print("Error: --iterations must be >= 1", file=sys.stderr)
+        return 2
     workdir = Path(args.workdir).resolve() if args.workdir else None
     report = run_sqlite_contention_benchmark(workdir=workdir, iterations=args.iterations)
     print(json.dumps(report, indent=2))
@@ -48,8 +51,12 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_dr_drill(args: argparse.Namespace) -> int:
+    max_size_mb = int(getattr(args, "max_size_mb", 2048))
+    if max_size_mb < 1:
+        print("Error: --max-size-mb must be >= 1", file=sys.stderr)
+        return 2
     backup_dir = Path(args.backup_dir).resolve()
-    max_bytes = int(getattr(args, "max_size_mb", 2048)) * 1024 * 1024
+    max_bytes = max_size_mb * 1024 * 1024
     results = run_dr_drill(backup_dir, max_uncompressed_bytes=max_bytes)
     if not results:
         print(f"No SQLite or PostgreSQL backup archives found in {backup_dir}", file=sys.stderr)

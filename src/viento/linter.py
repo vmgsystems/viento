@@ -53,7 +53,7 @@ WORKLOAD_KINDS = {
 }
 
 K8S_RELEVANT_KINDS = WORKLOAD_KINDS | {
-    "Secret", "PersistentVolumeClaim", "Canary", "MetricTemplate", "Provider"
+    "Namespace", "Service", "Secret", "PersistentVolumeClaim", "Canary", "MetricTemplate", "Provider"
 }
 
 
@@ -125,6 +125,10 @@ class InvariantLinter:
         self._explicit_pvc_floors = pvc_floors or {}
         self._live_pvc_cache: Dict[str, Dict[str, Any]] = {}
         self._live_pvc_loaded: bool = False
+        self._namespace_psa_enforce: Dict[str, Tuple[str, str]] = {}
+        self._host_access_workloads: List[Tuple[str, str, str, List[str]]] = []
+        self._service_selectors: List[Tuple[str, str, str, Dict[str, str]]] = []
+        self._job_pod_labels: List[Tuple[str, str, str, Dict[str, str]]] = []
 
     def _load_viento_config(self) -> Dict[str, Any]:
         cfg_path = self.repo_root / ".viento.yaml"
@@ -472,6 +476,36 @@ class InvariantLinter:
             meta = doc.get("metadata") or {}
             name = meta.get("name", "unnamed")
 
+            if kind == "Namespace":
+                labels = meta.get("labels") or {}
+                if isinstance(labels, dict):
+                    psa_enforce = str(labels.get("pod-security.kubernetes.io/enforce") or "").strip().lower()
+                    if psa_enforce in {"baseline", "restricted"} and name != "unnamed":
+                        self._namespace_psa_enforce[name] = (psa_enforce, rel_path)
+
+            if kind == "Service":
+                svc_sel = (doc.get("spec") or {}).get("selector") or {}
+                if isinstance(svc_sel, dict) and svc_sel:
+                    ns_svc = str(meta.get("namespace") or "default").strip()
+                    self._service_selectors.append(
+                        (ns_svc, rel_path, name, {str(k): str(v) for k, v in svc_sel.items()})
+                    )
+
+            if kind in {"Job", "CronJob"}:
+                ns_job = str(meta.get("namespace") or "default").strip()
+                if kind == "Job":
+                    tmpl_meta = (((doc.get("spec") or {}).get("template") or {}).get("metadata") or {})
+                else:
+                    tmpl_meta = (
+                        ((((doc.get("spec") or {}).get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("metadata")
+                        or {}
+                    )
+                pod_lbls = tmpl_meta.get("labels") or {}
+                if isinstance(pod_lbls, dict) and pod_lbls:
+                    self._job_pod_labels.append(
+                        (ns_job, rel_path, f"{kind}/{name}", {str(k): str(v) for k, v in pod_lbls.items()})
+                    )
+
             if kind == "Secret":
                 if not file_path.name.endswith((".sops.yaml", ".sops.yml")):
                     self.violations.append(
@@ -514,6 +548,27 @@ class InvariantLinter:
                     self.check_k8s_container_spec(
                         c, rel_path, f"{kind}/{w_name} (ephemeral)", is_ephemeral=True
                     )
+
+                ns = str(meta.get("namespace") or "default").strip()
+                host_reasons: List[str] = []
+                vols = pod_spec.get("volumes") or []
+                hostpath_vols = [str(v.get("name", "vol")) for v in vols if isinstance(v, dict) and v.get("hostPath")]
+                if hostpath_vols:
+                    host_reasons.append(f"hostPath volumes ({', '.join(hostpath_vols)})")
+                all_c_ports = [
+                    p.get("hostPort")
+                    for c in (containers + init_containers + ephemeral_containers)
+                    if isinstance(c, dict)
+                    for p in (c.get("ports") or [])
+                    if isinstance(p, dict) and p.get("hostPort")
+                ]
+                if all_c_ports:
+                    host_reasons.append(f"hostPort ({', '.join(str(hp) for hp in all_c_ports)})")
+                for host_flag in ("hostNetwork", "hostPID", "hostIPC"):
+                    if pod_spec.get(host_flag) is True or str(pod_spec.get(host_flag)).strip().lower() == "true":
+                        host_reasons.append(f"{host_flag}=true")
+                if host_reasons:
+                    self._host_access_workloads.append((ns, rel_path, f"{kind}/{w_name}", host_reasons))
 
                 all_c = containers + init_containers + ephemeral_containers
                 for c in all_c:
@@ -704,8 +759,38 @@ class InvariantLinter:
                 )
             )
 
+    def check_psa_namespace_conflicts(self):
+        """Rule: PSA_BASELINE_HOSTPATH_CONFLICT - Workloads using hostPath/hostPort cannot run in baseline/restricted PSA namespaces."""
+        for ns, rel_path, workload_id, reasons in self._host_access_workloads:
+            if ns in self._namespace_psa_enforce:
+                psa_level, ns_file = self._namespace_psa_enforce[ns]
+                self.violations.append(
+                    InvariantViolation(
+                        rel_path,
+                        "PSA_BASELINE_HOSTPATH_CONFLICT",
+                        f"Workload '{workload_id}' in namespace '{ns}' uses {'; '.join(reasons)}, which violates PodSecurity '{psa_level}' enforced on Namespace '{ns}' ({ns_file})",
+                    )
+                )
+
+    def check_job_service_selector_collisions(self):
+        """Rule: CRONJOB_SERVICE_SELECTOR_COLLISION - Batch Job/CronJob pod labels must not match a live Service selector."""
+        for job_ns, job_file, job_id, pod_labels in self._job_pod_labels:
+            for svc_ns, svc_file, svc_name, selector in self._service_selectors:
+                if job_ns == svc_ns and all(pod_labels.get(k) == v for k, v in selector.items()):
+                    self.violations.append(
+                        InvariantViolation(
+                            job_file,
+                            "CRONJOB_SERVICE_SELECTOR_COLLISION",
+                            f"{job_id} in namespace '{job_ns}' has pod template labels matching Service/{svc_name} selector {selector} ({svc_file}), routing Service traffic into batch Job pods",
+                        )
+                    )
+
     def run(self, target_dir: Path = None) -> List[InvariantViolation]:
         self.violations.clear()
+        self._namespace_psa_enforce.clear()
+        self._host_access_workloads.clear()
+        self._service_selectors.clear()
+        self._job_pod_labels.clear()
         base = (target_dir or self.repo_root).resolve()
 
         for root, dirs, files in os.walk(base):
@@ -743,6 +828,8 @@ class InvariantLinter:
                 if ext in {".mjs", ".js"}:
                     self.check_node_syntax(p)
 
+        self.check_psa_namespace_conflicts()
+        self.check_job_service_selector_collisions()
         self.check_readme_coverage()
         return self.violations
 

@@ -20,7 +20,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.2.3"
+    assert __version__ == "0.3.0"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text
@@ -339,6 +339,94 @@ spec:
         assert ("ephemeral_pod.yaml", "DISALLOW_PRIVILEGED_CONTAINERS") in by_file_and_rule
         assert ("ephemeral_pod.yaml", "REQUIRE_RESOURCE_LIMITS") in by_file_and_rule
         assert ("unparenthesized_metric.yaml", "PROMQL_ZERO_DENOMINATOR_GUARD") in by_file_and_rule
+
+
+def test_viento_psa_hostpath_and_cronjob_service_selector_collision_and_sarif(capsys):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "README.md").write_text("# Test Repo\n", encoding="utf-8")
+        k8s_dir = root / "manifests"
+        k8s_dir.mkdir()
+        (k8s_dir / "psa_and_collision.yaml").write_text(
+            """apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: monitoring
+spec:
+  template:
+    spec:
+      containers:
+        - name: promtail
+          image: grafana/promtail:2.9.3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: varlog
+          hostPath:
+            path: /var/log
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant
+  namespace: apps
+spec:
+  selector:
+    app: qdrant
+  ports:
+    - port: 6333
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: qdrant-backup
+  namespace: apps
+spec:
+  schedule: "0 3 * * *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: qdrant
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: python:3.11-slim
+              resources:
+                requests:
+                  cpu: 20m
+                  memory: 32Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+""",
+            encoding="utf-8",
+        )
+        rc = main(["lint", str(root), "--sarif"])
+        assert rc == 1
+        out = capsys.readouterr().out
+        import json
+        sarif = json.loads(out)
+        assert sarif["version"] == "2.1.0"
+        rule_ids = {r["ruleId"] for r in sarif["runs"][0]["results"]}
+        assert "PSA_BASELINE_HOSTPATH_CONFLICT" in rule_ids
+        assert "CRONJOB_SERVICE_SELECTOR_COLLISION" in rule_ids
 
 
 def test_viento_bench_symmetric_methodology():

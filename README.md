@@ -1,4 +1,4 @@
-# VMG Viento (`v0.2.3`)
+# VMG Viento (`v0.3.0`)
 
 **Autonomous Infrastructure & Zero-Drag Operations — Maximum Net Velocity Toward the Mark.**
 

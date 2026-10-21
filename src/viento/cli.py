@@ -14,6 +14,50 @@ from viento.dr_drill import run_dr_drill
 from viento.linter import InvariantLinter
 
 
+def to_sarif(violations: list, version: str) -> dict:
+    rules_seen: dict = {}
+    results: list = []
+    for v in violations:
+        if v.rule not in rules_seen:
+            rules_seen[v.rule] = {
+                "id": v.rule,
+                "name": v.rule,
+                "shortDescription": {"text": f"VMG Viento invariant rule {v.rule}"},
+            }
+        results.append(
+            {
+                "ruleId": v.rule,
+                "level": "error",
+                "message": {"text": v.message},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": str(v.file_path).replace("\\", "/")},
+                            "region": {"startLine": max(1, int(v.line_number or 1))},
+                        }
+                    }
+                ],
+            }
+        )
+    return {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "viento",
+                        "version": version,
+                        "informationUri": "https://github.com/vmgsystems/viento",
+                        "rules": list(rules_seen.values()),
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+
+
 def cmd_lint(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
     linter = InvariantLinter(root)
@@ -21,7 +65,10 @@ def cmd_lint(args: argparse.Namespace) -> int:
     if getattr(args, "verify_flux_sync", False):
         violations.extend(linter.check_flux_kustomization_readiness())
     score = max(0.0, round(10.0 - (len(violations) * 0.5), 1))
-    if args.json:
+    out_fmt = getattr(args, "format", None) or ("sarif" if getattr(args, "sarif", False) else ("json" if args.json else "text"))
+    if out_fmt == "sarif":
+        print(json.dumps(to_sarif(violations, __version__), indent=2))
+    elif out_fmt == "json":
         print(
             json.dumps(
                 {
@@ -77,6 +124,8 @@ def main(argv=None) -> int:
     p_lint = sub.add_parser("lint", help="Run mechanical GitOps & Kubernetes zero-trust linter")
     p_lint.add_argument("path", nargs="?", default=".", help="Repository path to lint")
     p_lint.add_argument("--json", action="store_true", help="Output JSON scorecard")
+    p_lint.add_argument("--sarif", action="store_true", help="Output SARIF 2.1.0 report")
+    p_lint.add_argument("--format", choices=["text", "json", "sarif"], default=None, help="Output format")
     p_lint.add_argument("--verify-flux-sync", action="store_true", help="Verify live FluxCD Kustomizations report Ready=True")
 
     p_bench = sub.add_parser("bench", help="Run SQLite DELETE vs tuned WAL contention benchmark")

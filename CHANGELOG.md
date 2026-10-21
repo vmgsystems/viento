@@ -2,6 +2,13 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.3.0] - 2026-10-20
+
+### Added
+- **SARIF 2.1.0 Code Scanning Output (`viento lint --sarif` / `--format sarif`):** Emits OASIS SARIF `2.1.0` reports for native GitHub and Forgejo Code Scanning integration.
+- **PodSecurity Admission Host-Access Conflict Guard (`PSA_BASELINE_HOSTPATH_CONFLICT`):** Cross-checks `Namespace` `pod-security.kubernetes.io/enforce: baseline|restricted` labels against workloads declaring `hostPath`, `hostPort`, `hostNetwork`, `hostPID`, or `hostIPC`.
+- **Batch Job / Service Selector Collision Guard (`CRONJOB_SERVICE_SELECTOR_COLLISION`):** Cross-checks `Job` and `CronJob` pod template labels against `Service.spec.selector` in the same namespace to prevent live `Service` traffic from routing into batch `Job` pods.
+
 ## [v0.2.3] - 2026-10-17
 
 ### Security & Adversarial Hardening

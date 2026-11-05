@@ -262,26 +262,58 @@ def verify_postgres_custom_archive(
                     timeout=15,
                     check=False,
                 )
-                if proc.returncode == 0 and proc.stdout.strip():
-                    lines = [ln for ln in proc.stdout.splitlines() if ln.strip() and not ln.strip().startswith(";")]
-                    tbl_cnt = sum(1 for ln in lines if " TABLE " in ln)
-                    data_cnt = sum(1 for ln in lines if " TABLE DATA " in ln)
-                    if tbl_cnt > 0:
-                        return ArchiveDrillResult(
-                            archive_name=archive_path.name,
-                            passed=True,
-                            integrity_status="ok",
-                            table_count=tbl_cnt,
-                            total_rows=max(data_cnt, tbl_cnt),
-                            detail=f"OK (PGDMP v{vmaj}.{vmin}.{vrev}, pg_restore TOC verified)",
-                        )
+                if proc.returncode != 0 or not proc.stdout.strip():
+                    return ArchiveDrillResult(
+                        archive_name=archive_path.name,
+                        passed=False,
+                        integrity_status="corrupt_pgdmp_toc",
+                        table_count=0,
+                        total_rows=0,
+                        detail="pg_restore --list failed to parse custom archive TOC",
+                    )
+                lines = [ln for ln in proc.stdout.splitlines() if ln.strip() and not ln.strip().startswith(";")]
+                tbl_cnt = sum(1 for ln in lines if " TABLE " in ln)
+                data_cnt = sum(1 for ln in lines if " TABLE DATA " in ln)
+                if tbl_cnt == 0:
+                    return ArchiveDrillResult(
+                        archive_name=archive_path.name,
+                        passed=False,
+                        integrity_status="empty_toc",
+                        table_count=0,
+                        total_rows=0,
+                        detail="Empty PGDMP TOC",
+                    )
+                proc_restore = subprocess.run(
+                    ["pg_restore", "-f", "-", str(tmp_dump)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc_restore.returncode != 0 or "PostgreSQL database dump complete" not in proc_restore.stdout:
+                    return ArchiveDrillResult(
+                        archive_name=archive_path.name,
+                        passed=False,
+                        integrity_status="truncated_pgdmp",
+                        table_count=tbl_cnt,
+                        total_rows=0,
+                        detail="pg_restore stream verification failed or missing completion footer",
+                    )
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=True,
+                    integrity_status="ok",
+                    table_count=tbl_cnt,
+                    total_rows=max(data_cnt, tbl_cnt),
+                    detail=f"OK (PGDMP v{vmaj}.{vmin}.{vrev}, pg_restore TOC & stream verified)",
+                )
             text_view = data.decode("utf-8", errors="ignore")
             create_tables = re.findall(r"CREATE\s+TABLE\b", text_view, flags=re.IGNORECASE)
             table_toc_markers = re.findall(r"\bTABLE\s+DATA\b", text_view)
-            has_end_marker = b"PGDMP_END" in data or text_view.rstrip().endswith(";") or len(table_toc_markers) > 0
+            has_end_marker = b"\\.\n" in data[-64:] or b"PGDMP_END;" in data[-64:]
             table_count = len(create_tables)
             row_blocks = max(len(table_toc_markers), table_count)
-            passed = table_count > 0 and has_end_marker
+            passed = table_count > 0 and len(table_toc_markers) > 0 and has_end_marker
             if not passed:
                 status = "empty_toc" if table_count == 0 else "truncated_pgdmp"
                 detail = "Empty PGDMP schema (no CREATE TABLE TOC entries found)" if table_count == 0 else "Truncated PGDMP archive"

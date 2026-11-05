@@ -2,14 +2,12 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
-## [v0.4.0] - 2026-11-05
+## [v0.4.1] - 2026-11-05
 
 ### Added
 - **Post-Render Kustomize & Helm Overlay Linting (`viento lint`):** Added `--kustomize-build` (`render_kustomize_overlay`) and `--helm-template` (`render_helm_chart`) flags (`check_rendered_overlays`) to render and validate Kustomize overlays (`kustomization.yaml`, `images:`, `patches:`) and Helm charts (`Chart.yaml`, `values.yaml`, `templates/*.yaml`) via native CLI binaries or deterministic Python fallback.
-- **PostgreSQL Custom-Format (`PGDMP`) Cold-Archive Verification (`viento dr-drill`):** Added `verify_postgres_custom_archive` supporting `.dump`, `.dump.gz`, `.pgdump`, `.pgdump.gz`, `.backup`, and `.backup.gz` archives with 5-byte `PGDMP` magic header validation, format version checks, TOC schema/data verification, and bounded streaming decompression.
+- **PostgreSQL Custom-Format (`PGDMP`) Cold-Archive Verification (`viento dr-drill`):** Added `verify_postgres_custom_archive` supporting `.dump`, `.dump.gz`, `.pgdump`, `.pgdump.gz`, `.backup`, and `.backup.gz` archives with 5-byte `PGDMP` magic header validation, format version checks, authoritative `pg_restore --list` and `pg_restore -f -` stream restore verification, and bounded streaming decompression.
 - **Kubernetes `etcd` BoltDB (`bbolt`) Snapshot Verification (`viento dr-drill`):** Added `verify_etcd_snapshot_archive` supporting `.etcd`, `.etcd.gz`, `.snap`, and `.snap.gz` cluster snapshots with little-endian BoltDB magic (`0xEDDA0CDA`) verification on meta pages, page-count truncation detection, and etcd KV bucket validation.
-- **Opt-In Emoji & Typography Hygiene (`ZERO_EMOJI`):** Added opt-in `enforce_zero_emoji` configuration key in `.viento.yaml` and `--enforce-zero-emoji` CLI flag.
-
 ## [v0.3.0] - 2026-10-20
 
 ### Added

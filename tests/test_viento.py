@@ -28,7 +28,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.4.0"
+    assert __version__ == "0.4.1"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text
@@ -665,24 +665,42 @@ def test_viento_dr_drill_pgdmp_custom_and_etcd_bbolt_snapshots():
     with tempfile.TemporaryDirectory() as tmpdir:
         base = Path(tmpdir)
 
-        # 1. Valid PostgreSQL custom-format (PGDMP v1.14.0) compressed archive (.dump.gz)
-        pgdmp_payload = (
-            b"PGDMP"
-            + bytes([1, 14, 0, 4, 8, 1])
-            + b"\x00" * 32
-            + b"CREATE TABLE public.accounts (id integer PRIMARY KEY, email text);\n"
-            + b"TABLE DATA public.accounts\n"
-            + b"PGDMP_END;"
+        # 1. Genuine PostgreSQL 16.15 pg_dump -Fc -Z 0 custom-format archive (.dump.gz)
+        import base64
+
+        real_pgdmp_gz_b64 = (
+            "H4sIAAAAAAACA51V62rbMBRWL1tbs250sLEfYxzYIC2U0KZNaBmFeYnbhDm2sd2NQsGotuKaJbax"
+            "ldLu9nJ7iT3BnmOSbOfWuNsqkGJJ50jfd86nE+Ok1TUWnqDl1QWENhBrr/nwjA8P+CDx4Qcq2irr"
+            "cZRSPyGpMNhtVHfrE19r3OpmvbBnp6KdfOS+itbUWx3tZHqyyE1fsW4pNrj9gITUIaEbeUHowxFU"
+            "Tu3jg8pbaYGfUzoIED3cT4mYLo0wf5mLhhOz7JZlmwyBNTsViDZzRCnFoYcTz3GjsBclA4bKSWnC"
+            "flKOLgrvj+1rOTZFNpttQ7bbs1OB7UCsqUrThth3XExxP/KrKaECZOBvVlKCE/fSiTG9rGxDhXUB"
+            "YOveWL+NsC7zdNcaNQG3Pi0KPmnJtvxetpQMasp601RkW4FiAwpz+NSx22ArXUPl+0dAySDuY0p2"
+            "oFDHSACg6k1ZVRzD1D92WorJNvrBhZsvczMSOqdWdUh7XC3oBUdi6sbtW+eHQFAND8LSAHyfm6yN"
+            "CcKjG9AKJ613u4pmCzukjRdA1+ZEomNBxSM9POxTwB4TWcA0hmlwRYClNCQuDaIQPJbpC5ySuyR3"
+            "m4jI2N5+vTbD6CGaTGmtkT/lvUZt7xA9Zl9XA9/xEqcXXNNhQoS91WwrXXn8ZvPUZssw7cCy8LLI"
+            "QonBvTLxC01LsX5Y4N7P6gx23WgY0qxGsUiruRbNMWCxOgOnWvjBpgSsBR4EISU+SUDTbdBOVXVb"
+            "bJABDvpMrNdUYg8KvSlI3nloTnZeYEdcLgmO5+SP+zVmgnC1nisxF2JJBKQiAkJzwn8i0nUhS+Os"
+            "PBCBt53R3YJjU++yasjKMuN8m8WdCuQrtd2Mw+LPlZzD70fTAtxpjGg00PMJGlB8OPFnciNINXWN"
+            "lWu5w14Yd0bnrMuqzQpDRlfX1FJaIolyqwXjQ6ZvAMPsdGXzDD4oZzwGPMvt/7gAhBzKTv+LEv4l"
+            "hkvjWiSE8JQ/hLUoTt+xA6vpTcoqaSoJ5/OqJIn/cfQHWqe8aO8HAAA="
         )
         dump_gz = base / "accounts.dump.gz"
-        with gzip.open(dump_gz, "wb") as f_out:
-            f_out.write(pgdmp_payload)
+        dump_gz.write_bytes(base64.b64decode(real_pgdmp_gz_b64))
 
         pg_res = verify_postgres_custom_archive(dump_gz)
         assert pg_res.passed is True
         assert pg_res.integrity_status == "ok"
         assert pg_res.table_count == 1
         assert pg_res.total_rows >= 1
+
+        # Mid-stream truncated custom archive (TOC intact, data block trailer truncated) must fail as truncated_pgdmp
+        raw_pgdmp = gzip.decompress(base64.b64decode(real_pgdmp_gz_b64))
+        trunc_dump = base / "truncated.dump"
+        trunc_dump.write_bytes(raw_pgdmp[:-40])
+        trunc_pg_res = verify_postgres_custom_archive(trunc_dump)
+        assert trunc_pg_res.passed is False
+        assert trunc_pg_res.integrity_status == "truncated_pgdmp"
+        trunc_dump.unlink()
 
         # Invalid PGDMP header must fail
         bad_dump = base / "corrupt.dump"

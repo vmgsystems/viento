@@ -1087,7 +1087,7 @@ class InvariantLinter:
                             deduped.append(v)
                     self.violations = deduped
 
-    def to_sarif(self, version: str = "0.4.0") -> Dict[str, Any]:
+    def to_sarif(self, version: str = "0.4.1") -> Dict[str, Any]:
         """Generates an OASIS SARIF v2.1.0 report for GitHub/Forgejo/GitLab code scanning."""
         unique_rules = sorted({v.rule for v in self.violations})
         return {

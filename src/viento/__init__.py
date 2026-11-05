@@ -1,3 +1,3 @@
 """VMG Viento Open-Core Package."""
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

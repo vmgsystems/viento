@@ -14,60 +14,27 @@ from viento.dr_drill import run_dr_drill
 from viento.linter import InvariantLinter
 
 
-def to_sarif(violations: list, version: str) -> dict:
-    rules_seen: dict = {}
-    results: list = []
-    for v in violations:
-        if v.rule not in rules_seen:
-            rules_seen[v.rule] = {
-                "id": v.rule,
-                "name": v.rule,
-                "shortDescription": {"text": f"VMG Viento invariant rule {v.rule}"},
-            }
-        results.append(
-            {
-                "ruleId": v.rule,
-                "level": "error",
-                "message": {"text": v.message},
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": str(v.file_path).replace("\\", "/")},
-                            "region": {"startLine": max(1, int(v.line_number or 1))},
-                        }
-                    }
-                ],
-            }
-        )
-    return {
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        "name": "viento",
-                        "version": version,
-                        "informationUri": "https://github.com/vmgsystems/viento",
-                        "rules": list(rules_seen.values()),
-                    }
-                },
-                "results": results,
-            }
-        ],
-    }
-
-
 def cmd_lint(args: argparse.Namespace) -> int:
     root = Path(args.path).resolve()
-    linter = InvariantLinter(root)
+    linter = InvariantLinter(root, enforce_zero_emoji=getattr(args, "enforce_zero_emoji", False))
     violations = linter.run()
+    kustomize_build = bool(getattr(args, "kustomize_build", False))
+    helm_template = bool(getattr(args, "helm_template", False))
+    if kustomize_build or helm_template:
+        linter.check_rendered_overlays(
+            target_dir=root,
+            kustomize_build=kustomize_build,
+            helm_template=helm_template,
+        )
+        violations = linter.violations
     if getattr(args, "verify_flux_sync", False):
         violations.extend(linter.check_flux_kustomization_readiness())
     score = max(0.0, round(10.0 - (len(violations) * 0.5), 1))
-    out_fmt = getattr(args, "format", None) or ("sarif" if getattr(args, "sarif", False) else ("json" if args.json else "text"))
+    out_fmt = "sarif" if getattr(args, "sarif", False) else (
+        "json" if getattr(args, "json", False) else getattr(args, "format", "text")
+    )
     if out_fmt == "sarif":
-        print(json.dumps(to_sarif(violations, __version__), indent=2))
+        print(json.dumps(linter.to_sarif(version=__version__), indent=2))
     elif out_fmt == "json":
         print(
             json.dumps(
@@ -106,7 +73,7 @@ def cmd_dr_drill(args: argparse.Namespace) -> int:
     max_bytes = max_size_mb * 1024 * 1024
     results = run_dr_drill(backup_dir, max_uncompressed_bytes=max_bytes)
     if not results:
-        print(f"No SQLite or PostgreSQL backup archives found in {backup_dir}", file=sys.stderr)
+        print(f"No SQLite, PostgreSQL, or etcd backup archives found in {backup_dir}", file=sys.stderr)
         return 1
     failed = [r for r in results if not r.passed]
     for r in results:
@@ -123,17 +90,20 @@ def main(argv=None) -> int:
 
     p_lint = sub.add_parser("lint", help="Run mechanical GitOps & Kubernetes zero-trust linter")
     p_lint.add_argument("path", nargs="?", default=".", help="Repository path to lint")
+    p_lint.add_argument("--format", choices=["text", "json", "sarif"], default="text", help="Output format (text, json, sarif)")
     p_lint.add_argument("--json", action="store_true", help="Output JSON scorecard")
-    p_lint.add_argument("--sarif", action="store_true", help="Output SARIF 2.1.0 report")
-    p_lint.add_argument("--format", choices=["text", "json", "sarif"], default=None, help="Output format")
+    p_lint.add_argument("--sarif", action="store_true", help="Output OASIS SARIF 2.1.0 report")
+    p_lint.add_argument("--kustomize-build", action="store_true", help="Render and lint Kustomize overlays")
+    p_lint.add_argument("--helm-template", action="store_true", help="Render and lint Helm charts")
     p_lint.add_argument("--verify-flux-sync", action="store_true", help="Verify live FluxCD Kustomizations report Ready=True")
+    p_lint.add_argument("--enforce-zero-emoji", action="store_true", help="Enforce strict zero-emoji rule even if not set in .viento.yaml")
 
     p_bench = sub.add_parser("bench", help="Run SQLite DELETE vs tuned WAL contention benchmark")
     p_bench.add_argument("--workdir", default=None, help="Directory to benchmark (defaults to temp dir)")
     p_bench.add_argument("--iterations", type=int, default=100, help="Number of transactions per run")
 
-    p_dr = sub.add_parser("dr-drill", help="Decompress and verify cold SQLite & PostgreSQL backup archives")
-    p_dr.add_argument("--backup-dir", required=True, help="Directory containing .sqlite3.gz, .db, or .sql.gz backups")
+    p_dr = sub.add_parser("dr-drill", help="Decompress and verify cold SQLite, PostgreSQL & etcd backup archives")
+    p_dr.add_argument("--backup-dir", required=True, help="Directory containing .sqlite3.gz, .db, .sql.gz, .dump, or .etcd backups")
     p_dr.add_argument("--max-size-mb", type=int, default=2048, help="Max uncompressed archive size in MiB (default: 2048)")
 
     sub.add_parser("version", help="Print VMG Viento SemVer version")

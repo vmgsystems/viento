@@ -1,7 +1,9 @@
 """Comprehensive unit and behavioral test suite for VMG Viento Open-Core CLI."""
 
 import gzip
+import json
 import sqlite3
+import struct
 import tempfile
 from pathlib import Path
 
@@ -10,7 +12,13 @@ import pytest
 from viento import __version__
 from viento.bench import run_sqlite_contention_benchmark
 from viento.cli import main
-from viento.dr_drill import run_dr_drill, verify_postgres_sql_archive, verify_sqlite_archive
+from viento.dr_drill import (
+    run_dr_drill,
+    verify_etcd_snapshot_archive,
+    verify_postgres_custom_archive,
+    verify_postgres_sql_archive,
+    verify_sqlite_archive,
+)
 from viento.linter import InvariantLinter
 
 
@@ -20,7 +28,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.4.0"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text
@@ -45,10 +53,10 @@ def test_viento_kyverno_policy_parity_with_linter():
 
 def test_viento_external_repo_portability_any_directory_and_readme():
     """Verifies viento lint inspects K8s manifests in arbitrary directories (e.g., clusters/prod/)
-    and does not penalize external README.md files that omit Viento-specific marketing tokens."""
+    and does not penalize external README.md files that omit Viento-specific marketing tokens or use emojis."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        (root / "README.md").write_text("# External Enterprise GitOps Repository\n", encoding="utf-8")
+        (root / "README.md").write_text("# External Enterprise GitOps Repository \U0001F680\n", encoding="utf-8")
         clusters_dir = root / "clusters" / "production"
         clusters_dir.mkdir(parents=True)
 
@@ -160,6 +168,76 @@ spec:
   query: |
     sum(rate(traefik_service_requests_total{service=~"{{ target }}", code!~"5.*"}[1m]))
     / (sum(rate(traefik_service_requests_total{service=~"{{ target }}"}[1m]))) * 100
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+  namespace: logging
+spec:
+  template:
+    spec:
+      containers:
+        - name: collector
+          image: grafana/promtail:3.1.0
+          ports:
+            - containerPort: 1514
+              hostPort: 514
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: pods
+          hostPath:
+            path: /var/log/pods
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-svc
+  namespace: apps
+spec:
+  selector:
+    app: api-svc
+  ports:
+    - port: 80
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: api-svc-probe
+  namespace: apps
+spec:
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: api-svc
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: probe
+              image: curlimages/curl:8.10.1
+              resources:
+                requests:
+                  cpu: 10m
+                  memory: 16Mi
+                limits:
+                  cpu: 50m
+                  memory: 32Mi
 """,
             encoding="utf-8",
         )
@@ -171,7 +249,8 @@ spec:
         assert "FLAGGER_SCHEMA_MUTUAL_EXCLUSION" in rules
         assert "TRAEFIK_METRIC_REGEX" in rules
         assert "PROMQL_ZERO_DENOMINATOR_GUARD" in rules
-
+        assert "PSA_BASELINE_HOSTPATH_CONFLICT" in rules
+        assert "CRONJOB_SERVICE_SELECTOR_COLLISION" in rules
 
 def test_viento_linter_adversarial_hardening_regressions():
     """Covers >8 KiB preamble comment padding, root .sops.yaml exclusion, multi-doc & key-level SOPS smuggling,
@@ -341,94 +420,6 @@ spec:
         assert ("unparenthesized_metric.yaml", "PROMQL_ZERO_DENOMINATOR_GUARD") in by_file_and_rule
 
 
-def test_viento_psa_hostpath_and_cronjob_service_selector_collision_and_sarif(capsys):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        root = Path(tmpdir)
-        (root / "README.md").write_text("# Test Repo\n", encoding="utf-8")
-        k8s_dir = root / "manifests"
-        k8s_dir.mkdir()
-        (k8s_dir / "psa_and_collision.yaml").write_text(
-            """apiVersion: v1
-kind: Namespace
-metadata:
-  name: monitoring
-  labels:
-    pod-security.kubernetes.io/enforce: baseline
----
-apiVersion: apps/v1
-kind: DaemonSet
-metadata:
-  name: promtail
-  namespace: monitoring
-spec:
-  template:
-    spec:
-      containers:
-        - name: promtail
-          image: grafana/promtail:2.9.3
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
-              memory: 256Mi
-      volumes:
-        - name: varlog
-          hostPath:
-            path: /var/log
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: qdrant
-  namespace: apps
-spec:
-  selector:
-    app: qdrant
-  ports:
-    - port: 6333
----
-apiVersion: batch/v1
-kind: CronJob
-metadata:
-  name: qdrant-backup
-  namespace: apps
-spec:
-  schedule: "0 3 * * *"
-  jobTemplate:
-    spec:
-      template:
-        metadata:
-          labels:
-            app: qdrant
-            component: backup
-        spec:
-          restartPolicy: OnFailure
-          containers:
-            - name: backup
-              image: python:3.11-slim
-              resources:
-                requests:
-                  cpu: 20m
-                  memory: 32Mi
-                limits:
-                  cpu: 200m
-                  memory: 128Mi
-""",
-            encoding="utf-8",
-        )
-        rc = main(["lint", str(root), "--sarif"])
-        assert rc == 1
-        out = capsys.readouterr().out
-        import json
-        sarif = json.loads(out)
-        assert sarif["version"] == "2.1.0"
-        rule_ids = {r["ruleId"] for r in sarif["runs"][0]["results"]}
-        assert "PSA_BASELINE_HOSTPATH_CONFLICT" in rule_ids
-        assert "CRONJOB_SERVICE_SELECTOR_COLLISION" in rule_ids
-
-
 def test_viento_bench_symmetric_methodology():
     with pytest.raises(ValueError, match="iterations must be >= 1"):
         run_sqlite_contention_benchmark(iterations=0)
@@ -538,3 +529,207 @@ COMMIT;
         early_commit_res = verify_postgres_sql_archive(early_commit_sql)
         assert early_commit_res.passed is False
         assert early_commit_res.integrity_status == "missing_completion_footer"
+
+
+def test_viento_sarif_and_rendered_kustomize_helm_linting(capsys):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "README.md").write_text("# Overlay & SARIF Test Repo\n", encoding="utf-8")
+
+        # 1. Kustomize base (clean) + overlay that mutates image to :latest and patches privileged: true
+        base_dir = root / "k8s" / "base"
+        overlay_dir = root / "k8s" / "overlays" / "staging"
+        base_dir.mkdir(parents=True)
+        overlay_dir.mkdir(parents=True)
+
+        (base_dir / "deployment.yaml").write_text(
+            """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-gateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: proxy
+          image: envoyproxy/envoy:v1.31.0
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+""",
+            encoding="utf-8",
+        )
+        (overlay_dir / "kustomization.yaml").write_text(
+            """apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: staging
+resources:
+  - ../../base/deployment.yaml
+images:
+  - name: envoyproxy/envoy
+    newTag: latest
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: edge-gateway
+      spec:
+        template:
+          spec:
+            containers:
+              - name: proxy
+                securityContext:
+                  privileged: true
+""",
+            encoding="utf-8",
+        )
+
+        # 2. Helm chart with templates/ directory (skipped by raw scan, evaluated by --helm-template)
+        chart_dir = root / "charts" / "worker"
+        tpl_dir = chart_dir / "templates"
+        tpl_dir.mkdir(parents=True)
+        (chart_dir / "Chart.yaml").write_text(
+            """apiVersion: v2
+name: worker
+version: 0.1.0
+appVersion: "1.0.0"
+""",
+            encoding="utf-8",
+        )
+        (chart_dir / "values.yaml").write_text(
+            """image:
+  repository: ghcr.io/acme/worker
+  tag: latest
+security:
+  privileged: true
+""",
+            encoding="utf-8",
+        )
+        (tpl_dir / "deployment.yaml").write_text(
+            """apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+spec:
+  template:
+    spec:
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          securityContext:
+            privileged: {{ .Values.security.privileged }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+""",
+            encoding="utf-8",
+        )
+
+        # Without overlay flags, base deployment is clean and templates/ is skipped
+        linter = InvariantLinter(root)
+        assert linter.run() == []
+
+        # With kustomize_build and helm_template enabled, both overlay and Helm violations are caught
+        linter.check_rendered_overlays(target_dir=root, kustomize_build=True, helm_template=True)
+        rules = {v.rule for v in linter.violations}
+        assert "DISALLOW_LATEST_TAG" in rules
+        assert "DISALLOW_PRIVILEGED_CONTAINERS" in rules
+        assert len(linter.violations) == 4
+
+        # Verify SARIF 2.1.0 output via CLI --format sarif
+        rc = main(["lint", str(root), "--kustomize-build", "--helm-template", "--format", "sarif"])
+        assert rc == 1
+        sarif_doc = json.loads(capsys.readouterr().out)
+        assert sarif_doc["version"] == "2.1.0"
+        driver = sarif_doc["runs"][0]["tool"]["driver"]
+        assert driver["name"] == "VMG Viento"
+        assert driver["version"] == __version__
+        sarif_results = sarif_doc["runs"][0]["results"]
+        assert len(sarif_results) == 4
+        assert {r["ruleId"] for r in sarif_results} == {"DISALLOW_LATEST_TAG", "DISALLOW_PRIVILEGED_CONTAINERS"}
+
+
+def test_viento_dr_drill_pgdmp_custom_and_etcd_bbolt_snapshots():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+
+        # 1. Valid PostgreSQL custom-format (PGDMP v1.14.0) compressed archive (.dump.gz)
+        pgdmp_payload = (
+            b"PGDMP"
+            + bytes([1, 14, 0, 4, 8, 1])
+            + b"\x00" * 32
+            + b"CREATE TABLE public.accounts (id integer PRIMARY KEY, email text);\n"
+            + b"TABLE DATA public.accounts\n"
+            + b"PGDMP_END;"
+        )
+        dump_gz = base / "accounts.dump.gz"
+        with gzip.open(dump_gz, "wb") as f_out:
+            f_out.write(pgdmp_payload)
+
+        pg_res = verify_postgres_custom_archive(dump_gz)
+        assert pg_res.passed is True
+        assert pg_res.integrity_status == "ok"
+        assert pg_res.table_count == 1
+        assert pg_res.total_rows >= 1
+
+        # Invalid PGDMP header must fail
+        bad_dump = base / "corrupt.dump"
+        bad_dump.write_bytes(b"NOT_PGDMP_ARCHIVE_HEADER" + b"\x00" * 64)
+        bad_pg_res = verify_postgres_custom_archive(bad_dump)
+        assert bad_pg_res.passed is False
+        assert bad_pg_res.integrity_status == "invalid_pgdmp_header"
+        bad_dump.unlink()
+
+        # 2. Valid Kubernetes etcd BoltDB (bbolt) 4-page snapshot (.etcd.gz)
+        page_size = 4096
+        bbolt_magic = 0xEDDA0CDA
+        page0 = bytearray(page_size)
+        struct.pack_into("<QHH", page0, 0, 0, 0x04, 0)
+        struct.pack_into("<III", page0, 16, bbolt_magic, 2, page_size)
+        struct.pack_into("<Q", page0, 56, 4)
+
+        page1 = bytearray(page0)
+        struct.pack_into("<Q", page1, 0, 1)
+
+        page2 = bytearray(page_size)
+        page3 = bytearray(page_size)
+        leaf_payload = b"key\x00meta\x00lease\x00/registry/pods/default/api-0\x00/registry/services/specs/default/api\x00"
+        page3[64 : 64 + len(leaf_payload)] = leaf_payload
+
+        etcd_bytes = bytes(page0 + page1 + page2 + page3)
+        etcd_gz = base / "cluster.etcd.gz"
+        with gzip.open(etcd_gz, "wb") as f_out:
+            f_out.write(etcd_bytes)
+
+        etcd_res = verify_etcd_snapshot_archive(etcd_gz)
+        assert etcd_res.passed is True
+        assert etcd_res.integrity_status == "ok"
+        assert etcd_res.table_count >= 3
+        assert etcd_res.total_rows >= 2
+
+        # Truncated etcd snapshot (meta declares 8 pages = 32768 bytes, but file is only 4 pages = 16384 bytes)
+        trunc_page0 = bytearray(page0)
+        struct.pack_into("<Q", trunc_page0, 56, 8)
+        trunc_etcd = base / "truncated.etcd"
+        trunc_etcd.write_bytes(bytes(trunc_page0 + page1 + page2 + page3))
+        trunc_etcd_res = verify_etcd_snapshot_archive(trunc_etcd)
+        assert trunc_etcd_res.passed is False
+        assert trunc_etcd_res.integrity_status == "truncated_snapshot"
+        trunc_etcd.unlink()
+
+        # Run full run_dr_drill across the directory containing .dump.gz and .etcd.gz
+        drill_results = run_dr_drill(base)
+        assert len(drill_results) == 2
+        assert all(r.passed for r in drill_results)

@@ -2,13 +2,20 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
+## [v0.4.0] - 2026-11-05
+
+### Added
+- **Post-Render Kustomize & Helm Overlay Linting (`viento lint`):** Added `--kustomize-build` (`render_kustomize_overlay`) and `--helm-template` (`render_helm_chart`) flags (`check_rendered_overlays`) to render and validate Kustomize overlays (`kustomization.yaml`, `images:`, `patches:`) and Helm charts (`Chart.yaml`, `values.yaml`, `templates/*.yaml`) via native CLI binaries or deterministic Python fallback.
+- **PostgreSQL Custom-Format (`PGDMP`) Cold-Archive Verification (`viento dr-drill`):** Added `verify_postgres_custom_archive` supporting `.dump`, `.dump.gz`, `.pgdump`, `.pgdump.gz`, `.backup`, and `.backup.gz` archives with 5-byte `PGDMP` magic header validation, format version checks, TOC schema/data verification, and bounded streaming decompression.
+- **Kubernetes `etcd` BoltDB (`bbolt`) Snapshot Verification (`viento dr-drill`):** Added `verify_etcd_snapshot_archive` supporting `.etcd`, `.etcd.gz`, `.snap`, and `.snap.gz` cluster snapshots with little-endian BoltDB magic (`0xEDDA0CDA`) verification on meta pages, page-count truncation detection, and etcd KV bucket validation.
+- **Opt-In Emoji & Typography Hygiene (`ZERO_EMOJI`):** Added opt-in `enforce_zero_emoji` configuration key in `.viento.yaml` and `--enforce-zero-emoji` CLI flag.
+
 ## [v0.3.0] - 2026-10-20
 
 ### Added
-- **SARIF 2.1.0 Code Scanning Output (`viento lint --sarif` / `--format sarif`):** Emits OASIS SARIF `2.1.0` reports for native GitHub and Forgejo Code Scanning integration.
+- **OASIS SARIF 2.1.0 Code Scanning Output (`viento lint`):** Added `--format sarif` and `--sarif` flags (`InvariantLinter.to_sarif`) emitting standard SARIF v2.1.0 reports with rule metadata, physical artifact locations, and 1-based line numbers for GitHub Security, Forgejo, and GitLab PR annotations.
 - **PodSecurity Admission Host-Access Conflict Guard (`PSA_BASELINE_HOSTPATH_CONFLICT`):** Cross-checks `Namespace` `pod-security.kubernetes.io/enforce: baseline|restricted` labels against workloads declaring `hostPath`, `hostPort`, `hostNetwork`, `hostPID`, or `hostIPC`.
 - **Batch Job / Service Selector Collision Guard (`CRONJOB_SERVICE_SELECTOR_COLLISION`):** Cross-checks `Job` and `CronJob` pod template labels against `Service.spec.selector` in the same namespace to prevent live `Service` traffic from routing into batch `Job` pods.
-
 ## [v0.2.3] - 2026-10-17
 
 ### Security & Adversarial Hardening
@@ -43,7 +50,7 @@ All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://s
 - **Universal Content-Aware Kubernetes YAML Discovery (`viento lint`):** Automatically detects and validates Kubernetes manifests (`Deployment`, `StatefulSet`, `DaemonSet`, `Job`, `CronJob`, `Pod`, `Secret`, `PersistentVolumeClaim`, `Canary`, `MetricTemplate`, `Provider`) across any directory (`clusters/`, `k8s/`, `manifests/`, `apps/`, `iac/k8s/`).
 - **Symmetric Apples-to-Apples Contention Benchmark (`viento bench`):** Reports `autocommit_insert_ms`, `interleaved_query_ms`, and `batched_tx_ms` across identical SQL execution profiles in `DELETE_DEFAULT` and `WAL_TUNED` modes, plus PVC-backed Kubernetes benchmark Job template (`manifests/viento-bench-job.yaml`).
 - **PostgreSQL Cold-Archive & Bounded Decompression Support (`viento dr-drill`):** Added `pg_dump` (`.sql.gz` / `.sql`) verification, `--max-size-mb` streaming decompression ceiling against gzip bombs, and virtual-table resilience.
-- **Configurable `.viento.yaml` Schema & CLI Flags:** Added `pvc_capacity_floors`, `privileged_allowlist`, `decommissioned_tokens`, `--verify-flux-sync` CLI flag, and standard `KUBECONFIG` / `~/.kube/config` resolution with guaranteed temporary certificate file cleanup.
+- **Configurable `.viento.yaml` Schema & CLI Flags:** Added `pvc_capacity_floors`, `privileged_allowlist`, `decommissioned_tokens`, opt-in `enforce_zero_emoji`, `--verify-flux-sync` CLI flag, and standard `KUBECONFIG` / `~/.kube/config` resolution with guaranteed temporary certificate file cleanup.
 
 ## [v0.1.0] - 2026-10-16
 

@@ -1,4 +1,5 @@
 # VMG Viento Repository Configuration
+enforce_zero_emoji: true
 readme_required_anchors:
   - token: "viento-lint"
     description: "viento-lint mechanical GitOps linter"

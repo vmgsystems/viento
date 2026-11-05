@@ -1,14 +1,17 @@
 """
 viento.dr_drill
 Automated cold-archive decompression and integrity verification (`viento dr-drill`)
-for SQLite (`.sqlite3.gz`, `.db.gz`, `.sqlite3`, `.db`) and PostgreSQL (`.sql.gz`, `.sql`)
-backups with bounded streaming decompression and virtual-table resilience.
+for SQLite (`.sqlite3.gz`, `.db.gz`, `.sqlite3`, `.db`), PostgreSQL SQL dumps (`.sql.gz`, `.sql`),
+PostgreSQL custom-format archives (`PGDMP` `.dump`, `.backup`, `.pgdump`), and Kubernetes `etcd`
+BoltDB (`bbolt`) snapshots (`.etcd`, `.snap`) with bounded streaming decompression and virtual-table resilience.
 """
 
 import gzip
 import re
 import shutil
 import sqlite3
+import struct
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -212,6 +215,189 @@ def verify_postgres_sql_archive(
         )
 
 
+def verify_postgres_custom_archive(
+    archive_path: Path,
+    max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+) -> ArchiveDrillResult:
+    """Verifies a PostgreSQL custom-format (pg_dump -Fc / PGDMP) archive (.dump, .backup, .pgdump, and .gz variants)."""
+    with tempfile.TemporaryDirectory(prefix="viento-pgdmp-") as tmpdir:
+        tmp_dump = Path(tmpdir) / "restored.dump"
+        try:
+            if archive_path.name.endswith(".gz"):
+                _stream_decompress_bounded(archive_path, tmp_dump, max_bytes=max_uncompressed_bytes)
+            else:
+                raw_size = archive_path.stat().st_size
+                if raw_size > max_uncompressed_bytes:
+                    raise ValueError(
+                        f"Uncompressed custom dump size ({raw_size} bytes) exceeds safety ceiling ({max_uncompressed_bytes} bytes)"
+                    )
+                shutil.copy2(archive_path, tmp_dump)
+
+            data = tmp_dump.read_bytes()
+            if len(data) < 32 or not data.startswith(b"PGDMP"):
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=False,
+                    integrity_status="invalid_pgdmp_header",
+                    table_count=0,
+                    total_rows=0,
+                    detail="Invalid or missing 5-byte PGDMP custom archive header",
+                )
+            vmaj, vmin, vrev = data[5], data[6], data[7]
+            if vmaj < 1 or vmaj > 2:
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=False,
+                    integrity_status="unsupported_pgdmp_version",
+                    table_count=0,
+                    total_rows=0,
+                    detail=f"Unsupported PGDMP version {vmaj}.{vmin}.{vrev}",
+                )
+
+            if shutil.which("pg_restore"):
+                proc = subprocess.run(
+                    ["pg_restore", "--list", str(tmp_dump)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    lines = [ln for ln in proc.stdout.splitlines() if ln.strip() and not ln.strip().startswith(";")]
+                    tbl_cnt = sum(1 for ln in lines if " TABLE " in ln)
+                    data_cnt = sum(1 for ln in lines if " TABLE DATA " in ln)
+                    passed = tbl_cnt > 0
+                    return ArchiveDrillResult(
+                        archive_name=archive_path.name,
+                        passed=passed,
+                        integrity_status="ok" if passed else "empty_toc",
+                        table_count=tbl_cnt,
+                        total_rows=max(data_cnt, tbl_cnt),
+                        detail=f"OK (PGDMP v{vmaj}.{vmin}.{vrev}, pg_restore TOC verified)" if passed else "Empty PGDMP TOC",
+                    )
+
+            text_view = data.decode("utf-8", errors="ignore")
+            create_tables = re.findall(r"CREATE\s+TABLE\b", text_view, flags=re.IGNORECASE)
+            table_toc_markers = re.findall(r"\bTABLE\s+DATA\b", text_view)
+            has_end_marker = b"PGDMP_END" in data or text_view.rstrip().endswith(";") or len(table_toc_markers) > 0
+            table_count = len(create_tables)
+            row_blocks = max(len(table_toc_markers), table_count)
+            passed = table_count > 0 and has_end_marker
+            if not passed:
+                status = "empty_toc" if table_count == 0 else "truncated_pgdmp"
+                detail = "Empty PGDMP schema (no CREATE TABLE TOC entries found)" if table_count == 0 else "Truncated PGDMP archive"
+            else:
+                status = "ok"
+                detail = f"OK (PGDMP v{vmaj}.{vmin}.{vrev} verified)"
+            return ArchiveDrillResult(
+                archive_name=archive_path.name,
+                passed=passed,
+                integrity_status=status,
+                table_count=table_count,
+                total_rows=row_blocks,
+                detail=detail,
+            )
+        except Exception as exc:
+            return ArchiveDrillResult(
+                archive_name=archive_path.name,
+                passed=False,
+                integrity_status="error",
+                table_count=0,
+                total_rows=0,
+                detail=str(exc),
+            )
+
+
+def verify_etcd_snapshot_archive(
+    archive_path: Path,
+    max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
+) -> ArchiveDrillResult:
+    """Verifies a Kubernetes etcd BoltDB (bbolt) snapshot (.etcd, .snap, and .gz variants)."""
+    bbolt_magic = 0xEDDA0CDA
+    page_size = 4096
+    with tempfile.TemporaryDirectory(prefix="viento-etcd-") as tmpdir:
+        tmp_snap = Path(tmpdir) / "snapshot.etcd"
+        try:
+            if archive_path.name.endswith(".gz"):
+                _stream_decompress_bounded(archive_path, tmp_snap, max_bytes=max_uncompressed_bytes)
+            else:
+                raw_size = archive_path.stat().st_size
+                if raw_size > max_uncompressed_bytes:
+                    raise ValueError(
+                        f"Uncompressed etcd snapshot size ({raw_size} bytes) exceeds safety ceiling ({max_uncompressed_bytes} bytes)"
+                    )
+                shutil.copy2(archive_path, tmp_snap)
+
+            data = tmp_snap.read_bytes()
+            if len(data) < page_size * 4:
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=False,
+                    integrity_status="truncated_snapshot",
+                    table_count=0,
+                    total_rows=0,
+                    detail=f"Snapshot smaller than minimum 4-page BoltDB layout ({len(data)} bytes)",
+                )
+
+            # In bbolt, page 0 and page 1 are meta pages. Page header is 16 bytes (pgid:u64, flags:u16, count:u16, overflow:u32),
+            # followed at offset 16 by meta struct (magic:u32 = 0xEDDA0CDA, version:u32 = 2, pageSize:u32, flags:u32).
+            valid_meta_pages = 0
+            declared_pgid_ceiling = 4
+            for page_idx in (0, 1):
+                base_off = page_idx * page_size
+                magic, version, psize = struct.unpack_from("<III", data, base_off + 16)
+                if magic == bbolt_magic and version == 2 and psize in {4096, 8192, 16384}:
+                    valid_meta_pages += 1
+                    # pgid in meta struct is at offset 16 + 40 = 56 (u64)
+                    if len(data) >= base_off + 64:
+                        meta_pgid = struct.unpack_from("<Q", data, base_off + 56)[0]
+                        if meta_pgid > declared_pgid_ceiling:
+                            declared_pgid_ceiling = meta_pgid
+
+            if valid_meta_pages == 0:
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=False,
+                    integrity_status="invalid_bbolt_magic",
+                    table_count=0,
+                    total_rows=0,
+                    detail="Missing BoltDB (0xEDDA0CDA) v2 meta page signature",
+                )
+
+            expected_min_bytes = declared_pgid_ceiling * page_size
+            if len(data) < expected_min_bytes:
+                return ArchiveDrillResult(
+                    archive_name=archive_path.name,
+                    passed=False,
+                    integrity_status="truncated_snapshot",
+                    table_count=0,
+                    total_rows=0,
+                    detail=f"Snapshot truncated at {len(data)} bytes (meta page requires >= {expected_min_bytes} bytes)",
+                )
+
+            bucket_markers = [b for b in (b"key", b"meta", b"lease", b"auth", b"members", b"cluster") if b in data[page_size * 2:]]
+            k8s_key_hits = data.count(b"/registry/")
+            bucket_count = len(bucket_markers)
+            passed = bucket_count >= 2
+            return ArchiveDrillResult(
+                archive_name=archive_path.name,
+                passed=passed,
+                integrity_status="ok" if passed else "missing_etcd_buckets",
+                table_count=bucket_count,
+                total_rows=max(k8s_key_hits, bucket_count),
+                detail="OK (bbolt etcd snapshot verified)" if passed else "Missing core etcd buckets (key/meta)",
+            )
+        except Exception as exc:
+            return ArchiveDrillResult(
+                archive_name=archive_path.name,
+                passed=False,
+                integrity_status="error",
+                table_count=0,
+                total_rows=0,
+                detail=str(exc),
+            )
+
+
 def run_dr_drill(
     backup_dir: Path,
     max_uncompressed_bytes: int = DEFAULT_MAX_UNCOMPRESSED_BYTES,
@@ -230,6 +416,20 @@ def run_dr_drill(
         list(backup_dir.glob("*.sql.gz"))
         + list(backup_dir.glob("*.sql"))
     )
+    pg_custom_candidates = sorted(
+        list(backup_dir.glob("*.dump.gz"))
+        + list(backup_dir.glob("*.dump"))
+        + list(backup_dir.glob("*.pgdump.gz"))
+        + list(backup_dir.glob("*.pgdump"))
+        + list(backup_dir.glob("*.backup.gz"))
+        + list(backup_dir.glob("*.backup"))
+    )
+    etcd_candidates = sorted(
+        list(backup_dir.glob("*.etcd.gz"))
+        + list(backup_dir.glob("*.etcd"))
+        + list(backup_dir.glob("*.snap.gz"))
+        + list(backup_dir.glob("*.snap"))
+    )
     for arch in sqlite_candidates:
         results.append(verify_sqlite_archive(arch, max_uncompressed_bytes=max_uncompressed_bytes))
     for arch in sql_candidates:
@@ -240,4 +440,8 @@ def run_dr_drill(
                 require_completion_footer=require_completion_footer,
             )
         )
+    for arch in pg_custom_candidates:
+        results.append(verify_postgres_custom_archive(arch, max_uncompressed_bytes=max_uncompressed_bytes))
+    for arch in etcd_candidates:
+        results.append(verify_etcd_snapshot_archive(arch, max_uncompressed_bytes=max_uncompressed_bytes))
     return results

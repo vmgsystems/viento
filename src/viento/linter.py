@@ -29,6 +29,16 @@ try:
 except ImportError:
     yaml = None
 
+EMOJI_REGEX = re.compile(
+    r"[\U0001F600-\U0001F64F"
+    r"\U0001F300-\U0001F5FF"
+    r"\U0001F680-\U0001F6FF"
+    r"\U0001F1E0-\U0001F1FF"
+    r"\U00002702-\U000027B0"
+    r"\U0001F900-\U0001F9FF"
+    r"\U0001FA70-\U0001FAFF]"
+)
+
 SKIP_DIRS = {
     ".git", ".vscode", ".idea", "node_modules", "vendor",
     "__pycache__", ".pytest_cache", ".claude",
@@ -117,11 +127,13 @@ class InvariantLinter:
         self,
         repo_root: Path,
         pvc_floors: Optional[Dict[str, str]] = None,
+        enforce_zero_emoji: bool = False,
     ):
         self.repo_root = repo_root.resolve()
         self.violations: List[InvariantViolation] = []
         self.gitignore = GitIgnoreResolver(self.repo_root)
         self.config: Dict[str, Any] = self._load_viento_config()
+        self.enforce_zero_emoji: bool = bool(enforce_zero_emoji or self.config.get("enforce_zero_emoji", False))
         self._explicit_pvc_floors = pvc_floors or {}
         self._live_pvc_cache: Dict[str, Dict[str, Any]] = {}
         self._live_pvc_loaded: bool = False
@@ -129,7 +141,6 @@ class InvariantLinter:
         self._host_access_workloads: List[Tuple[str, str, str, List[str]]] = []
         self._service_selectors: List[Tuple[str, str, str, Dict[str, str]]] = []
         self._job_pod_labels: List[Tuple[str, str, str, Dict[str, str]]] = []
-
     def _load_viento_config(self) -> Dict[str, Any]:
         cfg_path = self.repo_root / ".viento.yaml"
         if cfg_path.exists() and yaml is not None:
@@ -265,6 +276,35 @@ class InvariantLinter:
                     os.unlink(tf)
                 except OSError:
                     pass
+
+    def check_emojis(self, file_path: Path, content: Optional[str] = None):
+        """Rule: ZERO_EMOJI - Opt-in via .viento.yaml enforce_zero_emoji or --enforce-zero-emoji."""
+        if not self.enforce_zero_emoji:
+            return
+        if file_path.name in {"linter.py", "lint_invariants.py", "test_viento.py", "test_lint_invariants.py"}:
+            return
+
+        rel_path = str(file_path.relative_to(self.repo_root))
+        try:
+            text = content if content is not None else file_path.read_text(encoding="utf-8", errors="ignore")
+            if not EMOJI_REGEX.search(text):
+                return
+            for line_idx, line in enumerate(text.splitlines(), start=1):
+                if "FIXTURE_ALLOW_EMOJI" in line:
+                    continue
+                match = EMOJI_REGEX.search(line)
+                if match:
+                    char = match.group(0)
+                    self.violations.append(
+                        InvariantViolation(
+                            file_path=rel_path,
+                            rule="ZERO_EMOJI",
+                            message=f"Disallowed emoji detected (U+{ord(char):04X})",
+                            line_number=line_idx
+                        )
+                    )
+        except Exception:
+            pass
 
     def check_k8s_container_spec(
         self,
@@ -483,29 +523,6 @@ class InvariantLinter:
                     if psa_enforce in {"baseline", "restricted"} and name != "unnamed":
                         self._namespace_psa_enforce[name] = (psa_enforce, rel_path)
 
-            if kind == "Service":
-                svc_sel = (doc.get("spec") or {}).get("selector") or {}
-                if isinstance(svc_sel, dict) and svc_sel:
-                    ns_svc = str(meta.get("namespace") or "default").strip()
-                    self._service_selectors.append(
-                        (ns_svc, rel_path, name, {str(k): str(v) for k, v in svc_sel.items()})
-                    )
-
-            if kind in {"Job", "CronJob"}:
-                ns_job = str(meta.get("namespace") or "default").strip()
-                if kind == "Job":
-                    tmpl_meta = (((doc.get("spec") or {}).get("template") or {}).get("metadata") or {})
-                else:
-                    tmpl_meta = (
-                        ((((doc.get("spec") or {}).get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("metadata")
-                        or {}
-                    )
-                pod_lbls = tmpl_meta.get("labels") or {}
-                if isinstance(pod_lbls, dict) and pod_lbls:
-                    self._job_pod_labels.append(
-                        (ns_job, rel_path, f"{kind}/{name}", {str(k): str(v) for k, v in pod_lbls.items()})
-                    )
-
             if kind == "Secret":
                 if not file_path.name.endswith((".sops.yaml", ".sops.yml")):
                     self.violations.append(
@@ -535,6 +552,29 @@ class InvariantLinter:
                                         )
                                     )
 
+            if kind == "Service":
+                svc_sel = (doc.get("spec") or {}).get("selector") or {}
+                if isinstance(svc_sel, dict) and svc_sel:
+                    ns_svc = str(meta.get("namespace") or "default").strip()
+                    self._service_selectors.append(
+                        (ns_svc, rel_path, name, {str(k): str(v) for k, v in svc_sel.items()})
+                    )
+
+            if kind in {"Job", "CronJob"}:
+                ns_job = str(meta.get("namespace") or "default").strip()
+                if kind == "Job":
+                    tmpl_meta = (((doc.get("spec") or {}).get("template") or {}).get("metadata") or {})
+                else:
+                    tmpl_meta = (
+                        ((((doc.get("spec") or {}).get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("metadata")
+                        or {}
+                    )
+                pod_lbls = tmpl_meta.get("labels") or {}
+                if isinstance(pod_lbls, dict) and pod_lbls:
+                    self._job_pod_labels.append(
+                        (ns_job, rel_path, f"{kind}/{name}", {str(k): str(v) for k, v in pod_lbls.items()})
+                    )
+
             if kind in WORKLOAD_KINDS:
                 w_name, pod_spec = self.extract_pod_spec(doc)
                 containers = pod_spec.get("containers") or []
@@ -555,9 +595,10 @@ class InvariantLinter:
                 hostpath_vols = [str(v.get("name", "vol")) for v in vols if isinstance(v, dict) and v.get("hostPath")]
                 if hostpath_vols:
                     host_reasons.append(f"hostPath volumes ({', '.join(hostpath_vols)})")
+                all_c = containers + init_containers + ephemeral_containers
                 all_c_ports = [
                     p.get("hostPort")
-                    for c in (containers + init_containers + ephemeral_containers)
+                    for c in all_c
                     if isinstance(c, dict)
                     for p in (c.get("ports") or [])
                     if isinstance(p, dict) and p.get("hostPort")
@@ -569,8 +610,6 @@ class InvariantLinter:
                         host_reasons.append(f"{host_flag}=true")
                 if host_reasons:
                     self._host_access_workloads.append((ns, rel_path, f"{kind}/{w_name}", host_reasons))
-
-                all_c = containers + init_containers + ephemeral_containers
                 for c in all_c:
                     cmd_list = (c.get("command") or []) + (c.get("args") or [])
                     cmd_str = " ".join(str(item) for item in cmd_list)
@@ -771,7 +810,6 @@ class InvariantLinter:
                         f"Workload '{workload_id}' in namespace '{ns}' uses {'; '.join(reasons)}, which violates PodSecurity '{psa_level}' enforced on Namespace '{ns}' ({ns_file})",
                     )
                 )
-
     def check_job_service_selector_collisions(self):
         """Rule: CRONJOB_SERVICE_SELECTOR_COLLISION - Batch Job/CronJob pod labels must not match a live Service selector."""
         for job_ns, job_file, job_id, pod_labels in self._job_pod_labels:
@@ -792,7 +830,6 @@ class InvariantLinter:
         self._service_selectors.clear()
         self._job_pod_labels.clear()
         base = (target_dir or self.repo_root).resolve()
-
         for root, dirs, files in os.walk(base):
             dirs[:] = [
                 d for d in dirs
@@ -811,6 +848,7 @@ class InvariantLinter:
                         content = p.read_text(encoding="utf-8", errors="ignore")
                     except Exception:
                         content = None
+                    self.check_emojis(p, content=content)
                     self.check_plaintext_secrets(p, content=content)
 
                 if ext in {".md", ".py", ".sh", ".ts", ".yaml", ".yml"}:
@@ -832,6 +870,264 @@ class InvariantLinter:
         self.check_job_service_selector_collisions()
         self.check_readme_coverage()
         return self.violations
+
+    @staticmethod
+    def _deep_merge_dict(base_dict: Dict[str, Any], patch_dict: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in patch_dict.items():
+            if isinstance(v, dict) and isinstance(base_dict.get(k), dict):
+                InvariantLinter._deep_merge_dict(base_dict[k], v)
+            elif isinstance(v, list) and isinstance(base_dict.get(k), list) and k in {"containers", "initContainers", "ephemeralContainers"}:
+                by_name = {c.get("name"): c for c in base_dict[k] if isinstance(c, dict) and c.get("name")}
+                for item in v:
+                    if isinstance(item, dict) and item.get("name") in by_name:
+                        InvariantLinter._deep_merge_dict(by_name[item["name"]], item)
+                    else:
+                        base_dict[k].append(item)
+            else:
+                base_dict[k] = v
+        return base_dict
+
+    def render_kustomize_overlay(self, kustomize_dir: Path) -> str:
+        """Renders a Kustomize overlay directory using kustomize/kubectl or native Python YAML assembly."""
+        for cmd in (["kustomize", "build", str(kustomize_dir)], ["kubectl", "kustomize", str(kustomize_dir)]):
+            if shutil.which(cmd[0]):
+                try:
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+                    if proc.returncode == 0 and proc.stdout.strip():
+                        return proc.stdout
+                except Exception:
+                    pass
+        if yaml is None:
+            return ""
+        kust_file = kustomize_dir / "kustomization.yaml"
+        if not kust_file.exists():
+            kust_file = kustomize_dir / "kustomization.yml"
+        if not kust_file.exists():
+            return ""
+        try:
+            kust_doc = yaml.safe_load(kust_file.read_text(encoding="utf-8")) or {}
+            if not isinstance(kust_doc, dict):
+                return ""
+            resources = (kust_doc.get("resources") or []) + (kust_doc.get("bases") or [])
+            images = kust_doc.get("images") or []
+            patches = (kust_doc.get("patches") or []) + (kust_doc.get("patchesStrategicMerge") or [])
+            target_ns = kust_doc.get("namespace")
+
+            docs: List[Dict[str, Any]] = []
+            for res in resources:
+                res_path = (kustomize_dir / str(res)).resolve()
+                if res_path.is_dir():
+                    sub_yaml = self.render_kustomize_overlay(res_path)
+                    if sub_yaml:
+                        docs.extend([d for d in yaml.safe_load_all(sub_yaml) if isinstance(d, dict)])
+                elif res_path.is_file():
+                    docs.extend([d for d in yaml.safe_load_all(res_path.read_text(encoding="utf-8")) if isinstance(d, dict)])
+
+            for patch_entry in patches:
+                patch_text = ""
+                if isinstance(patch_entry, str):
+                    p_file = (kustomize_dir / patch_entry).resolve()
+                    if p_file.is_file():
+                        patch_text = p_file.read_text(encoding="utf-8")
+                elif isinstance(patch_entry, dict):
+                    if "patch" in patch_entry:
+                        patch_text = str(patch_entry["patch"])
+                    elif "path" in patch_entry:
+                        p_file = (kustomize_dir / str(patch_entry["path"])).resolve()
+                        if p_file.is_file():
+                            patch_text = p_file.read_text(encoding="utf-8")
+                if patch_text:
+                    for p_doc in yaml.safe_load_all(patch_text):
+                        if not isinstance(p_doc, dict):
+                            continue
+                        p_kind = p_doc.get("kind")
+                        p_name = (p_doc.get("metadata") or {}).get("name")
+                        for d in docs:
+                            if d.get("kind") == p_kind and (d.get("metadata") or {}).get("name") == p_name:
+                                self._deep_merge_dict(d, p_doc)
+
+            image_map = {str(img.get("name")): img for img in images if isinstance(img, dict) and img.get("name")}
+            for d in docs:
+                if target_ns and isinstance(d.get("metadata"), dict):
+                    d["metadata"].setdefault("namespace", target_ns)
+                if d.get("kind") in WORKLOAD_KINDS and image_map:
+                    _, pod_spec = self.extract_pod_spec(d)
+                    for c_list_key in ("containers", "initContainers", "ephemeralContainers"):
+                        for c in pod_spec.get(c_list_key) or []:
+                            raw_img = str(c.get("image") or "").strip()
+                            img_repo = raw_img.split(":", 1)[0].split("@", 1)[0]
+                            if img_repo in image_map or raw_img in image_map:
+                                rule = image_map.get(img_repo) or image_map.get(raw_img)
+                                new_repo = str(rule.get("newName") or img_repo)
+                                if rule.get("digest"):
+                                    c["image"] = f"{new_repo}@{rule['digest']}"
+                                elif rule.get("newTag") is not None:
+                                    c["image"] = f"{new_repo}:{rule['newTag']}"
+                                else:
+                                    c["image"] = new_repo
+
+            return yaml.safe_dump_all(docs) if docs else ""
+        except Exception:
+            return ""
+
+    def render_helm_chart(self, chart_dir: Path) -> str:
+        """Renders a Helm chart directory using helm template or native Python template substitution."""
+        if shutil.which("helm"):
+            try:
+                proc = subprocess.run(
+                    ["helm", "template", "viento-release", str(chart_dir)],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    return proc.stdout
+            except Exception:
+                pass
+        if yaml is None:
+            return ""
+        try:
+            chart_meta = yaml.safe_load((chart_dir / "Chart.yaml").read_text(encoding="utf-8")) or {}
+            values_path = chart_dir / "values.yaml"
+            values = yaml.safe_load(values_path.read_text(encoding="utf-8")) if values_path.exists() else {}
+            if not isinstance(values, dict):
+                values = {}
+            templates_dir = chart_dir / "templates"
+            if not templates_dir.is_dir():
+                return ""
+
+            def _lookup_path(root_obj: Any, dotted: str) -> Any:
+                cur = root_obj
+                for part in dotted.split("."):
+                    if not part:
+                        continue
+                    if isinstance(cur, dict) and part in cur:
+                        cur = cur[part]
+                    else:
+                        return None
+                return cur
+
+            def _replace_expr(match: re.Match) -> str:
+                expr = match.group(1).strip().lstrip("-").rstrip("-").strip()
+                default_val = None
+                if "|" in expr:
+                    parts = [p.strip() for p in expr.split("|")]
+                    expr = parts[0]
+                    for pipe_part in parts[1:]:
+                        m_def = re.match(r"default\s+[\x22\x27]?([^\x22\x27]+)[\x22\x27]?", pipe_part)
+                        if m_def:
+                            default_val = m_def.group(1)
+                if expr.startswith(".Values."):
+                    val = _lookup_path(values, expr[len(".Values."):])
+                elif expr.startswith(".Chart."):
+                    key = expr[len(".Chart."):]
+                    val = chart_meta.get(key) or chart_meta.get(key[0].lower() + key[1:])
+                elif expr == ".Release.Name":
+                    val = "viento-release"
+                elif expr == ".Release.Namespace":
+                    val = "default"
+                else:
+                    val = default_val
+                if val is None:
+                    val = default_val if default_val is not None else ""
+                if isinstance(val, bool):
+                    return "true" if val else "false"
+                return str(val)
+
+            rendered_docs: List[str] = []
+            for tpl_file in sorted(templates_dir.rglob("*")):
+                if not tpl_file.is_file() or tpl_file.suffix.lower() not in {".yaml", ".yml"}:
+                    continue
+                raw_tpl = tpl_file.read_text(encoding="utf-8", errors="ignore")
+                rendered = re.sub(r"\{\{(.*?)\}\}", _replace_expr, raw_tpl)
+                rendered_docs.append(rendered)
+            return "\n---\n".join(rendered_docs)
+        except Exception:
+            return ""
+
+    def check_rendered_overlays(self, target_dir: Path = None, kustomize_build: bool = False, helm_template: bool = False):
+        """Optionally renders and validates Kustomize overlays and Helm charts across the repository."""
+        if not kustomize_build and not helm_template:
+            return
+        base = (target_dir or self.repo_root).resolve()
+        existing_keys = {(v.rule, v.message) for v in self.violations}
+
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [
+                d for d in dirs
+                if d not in SKIP_DIRS and not self.gitignore.is_ignored(Path(root) / d)
+            ]
+            root_path = Path(root)
+            file_set = set(files)
+
+            if kustomize_build and ("kustomization.yaml" in file_set or "kustomization.yml" in file_set):
+                kust_file = root_path / ("kustomization.yaml" if "kustomization.yaml" in file_set else "kustomization.yml")
+                rendered = self.render_kustomize_overlay(root_path)
+                if rendered:
+                    before_len = len(self.violations)
+                    self.check_k8s_manifest(kust_file, content=rendered)
+                    deduped = self.violations[:before_len]
+                    for v in self.violations[before_len:]:
+                        if (v.rule, v.message) not in existing_keys:
+                            existing_keys.add((v.rule, v.message))
+                            deduped.append(v)
+                    self.violations = deduped
+
+            if helm_template and "Chart.yaml" in file_set:
+                chart_file = root_path / "Chart.yaml"
+                rendered = self.render_helm_chart(root_path)
+                if rendered:
+                    before_len = len(self.violations)
+                    self.check_k8s_manifest(chart_file, content=rendered)
+                    deduped = self.violations[:before_len]
+                    for v in self.violations[before_len:]:
+                        if (v.rule, v.message) not in existing_keys:
+                            existing_keys.add((v.rule, v.message))
+                            deduped.append(v)
+                    self.violations = deduped
+
+    def to_sarif(self, version: str = "0.4.0") -> Dict[str, Any]:
+        """Generates an OASIS SARIF v2.1.0 report for GitHub/Forgejo/GitLab code scanning."""
+        unique_rules = sorted({v.rule for v in self.violations})
+        return {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "VMG Viento",
+                            "informationUri": "https://www.vmg.systems",
+                            "version": version,
+                            "rules": [
+                                {
+                                    "id": rule_id,
+                                    "shortDescription": {"text": f"VMG Viento architectural & security invariant: {rule_id}"},
+                                }
+                                for rule_id in unique_rules
+                            ],
+                        }
+                    },
+                    "results": [
+                        {
+                            "ruleId": v.rule,
+                            "level": "error",
+                            "message": {"text": v.message},
+                            "locations": [
+                                {
+                                    "physicalLocation": {
+                                        "artifactLocation": {"uri": v.file_path},
+                                        "region": {"startLine": max(1, int(v.line_number or 1))},
+                                    }
+                                }
+                            ],
+                        }
+                        for v in self.violations
+                    ],
+                }
+            ],
+        }
 
     def check_flux_kustomization_readiness(self) -> List[InvariantViolation]:
         """Verifies live FluxCD Kustomizations report Ready=True."""

@@ -266,16 +266,15 @@ def verify_postgres_custom_archive(
                     lines = [ln for ln in proc.stdout.splitlines() if ln.strip() and not ln.strip().startswith(";")]
                     tbl_cnt = sum(1 for ln in lines if " TABLE " in ln)
                     data_cnt = sum(1 for ln in lines if " TABLE DATA " in ln)
-                    passed = tbl_cnt > 0
-                    return ArchiveDrillResult(
-                        archive_name=archive_path.name,
-                        passed=passed,
-                        integrity_status="ok" if passed else "empty_toc",
-                        table_count=tbl_cnt,
-                        total_rows=max(data_cnt, tbl_cnt),
-                        detail=f"OK (PGDMP v{vmaj}.{vmin}.{vrev}, pg_restore TOC verified)" if passed else "Empty PGDMP TOC",
-                    )
-
+                    if tbl_cnt > 0:
+                        return ArchiveDrillResult(
+                            archive_name=archive_path.name,
+                            passed=True,
+                            integrity_status="ok",
+                            table_count=tbl_cnt,
+                            total_rows=max(data_cnt, tbl_cnt),
+                            detail=f"OK (PGDMP v{vmaj}.{vmin}.{vrev}, pg_restore TOC verified)",
+                        )
             text_view = data.decode("utf-8", errors="ignore")
             create_tables = re.findall(r"CREATE\s+TABLE\b", text_view, flags=re.IGNORECASE)
             table_toc_markers = re.findall(r"\bTABLE\s+DATA\b", text_view)

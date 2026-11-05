@@ -2,7 +2,7 @@
 
 All notable changes to `VMG Viento` follow [Semantic Versioning 2.0.0](https://semver.org/).
 
-## [v0.4.1] - 2026-11-05
+## [v0.4.2] - 2026-11-05
 
 ### Added
 - **Post-Render Kustomize & Helm Overlay Linting (`viento lint`):** Added `--kustomize-build` (`render_kustomize_overlay`) and `--helm-template` (`render_helm_chart`) flags (`check_rendered_overlays`) to render and validate Kustomize overlays (`kustomization.yaml`, `images:`, `patches:`) and Helm charts (`Chart.yaml`, `values.yaml`, `templates/*.yaml`) via native CLI binaries or deterministic Python fallback.

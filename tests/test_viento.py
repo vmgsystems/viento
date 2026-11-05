@@ -28,7 +28,7 @@ def test_viento_semver_version_and_single_source_sync():
     pyproject_text = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     readme_text = (repo_root / "README.md").read_text(encoding="utf-8")
 
-    assert __version__ == "0.4.1"
+    assert __version__ == "0.4.2"
     assert version_file == __version__
     assert f'version = "{__version__}"' in pyproject_text
     assert f"(`v{__version__}`)" in readme_text

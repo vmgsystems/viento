@@ -272,7 +272,7 @@ def verify_postgres_custom_archive(
                         detail="pg_restore --list failed to parse custom archive TOC",
                     )
                 lines = [ln for ln in proc.stdout.splitlines() if ln.strip() and not ln.strip().startswith(";")]
-                tbl_cnt = sum(1 for ln in lines if " TABLE " in ln)
+                tbl_cnt = sum(1 for ln in lines if " TABLE " in ln and " TABLE DATA " not in ln)
                 data_cnt = sum(1 for ln in lines if " TABLE DATA " in ln)
                 if tbl_cnt == 0:
                     return ArchiveDrillResult(

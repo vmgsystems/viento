@@ -6,21 +6,39 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: viento-oss-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.11 (GitHub Hosted)
+        if: github.server_url == 'https://github.com' && runner.environment == 'github-hosted'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Provision Python Runtime (Debian Bookworm Runner Fallback)
+        if: runner.environment != 'github-hosted'
+        run: |
+          if ! command -v pip3 >/dev/null 2>&1 && ! python3 -m pip --version >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            (apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv python3-yaml python3-pytest) || \
+              (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv python3-yaml python3-pytest) || true
+          fi
+
       - name: Install VMG Viento CLI & Test Dependencies
         run: |
-          pip install -e ".[dev]"
+          python3 -m pip install --break-system-packages -e ".[dev]" || python3 -m pip install -e ".[dev]"
 
       - name: Execute Viento Self-Lint Gate
         run: |
